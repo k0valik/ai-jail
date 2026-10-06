@@ -593,9 +593,12 @@ const LOCAL_SHARE_RW: &[&str] = &[
 const BWRAP_ENV_VAR: &str = "BWRAP_BIN";
 const NIX_STORE: &str = "/nix/store";
 const BWRAP_CANDIDATES: &[&str] = &[
+    // Fork (MINE.md): /usr/local/bin precedes /usr/bin per standard local-
+    // override precedence, so a locally built bubblewrap (e.g. 0.13 for
+    // --overlay-src on Ubuntu 24.04, which ships 0.9) is picked up.
+    "/usr/local/bin/bwrap",
     "/usr/bin/bwrap",
     "/bin/bwrap",
-    "/usr/local/bin/bwrap",
     "/run/wrappers/bin/bwrap",
     "/run/current-system/sw/bin/bwrap",
 ];
