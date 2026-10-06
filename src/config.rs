@@ -296,6 +296,15 @@ pub struct Config {
     /// entries can carry secret values.
     #[serde(default, skip_serializing)]
     pub env_pass: Vec<String>,
+    /// Persistent /tmp leaf directories: each entry is a sandbox path
+    /// under /tmp (e.g. /tmp/jiti) backed by a jail-owned store
+    /// directory, so its contents survive across launches (jiti and
+    /// node-compile caches keep agent startup fast). Trusted layers
+    /// only (global config / CLI) — a project `.ai-jail` may not
+    /// enable it. Never serialized: paths stay out of auto-saved
+    /// configs, mirroring `env_pass`.
+    #[serde(default, skip_serializing)]
+    pub persistent_tmp: Vec<String>,
     /// Credential files read like `--env` entries (`KEY=VALUE` lines).
     /// Each file must exist, be a user-owned regular file (not a
     /// symlink), mode 0600 or stricter, and live outside the project
@@ -523,6 +532,11 @@ impl Config {
     }
     pub fn env_pass(&self) -> &[String] {
         &self.env_pass
+    }
+
+    /// Persistent /tmp leaf paths (see [`Config::persistent_tmp`]).
+    pub fn persistent_tmp(&self) -> &[String] {
+        &self.persistent_tmp
     }
     /// The status-bar update check phones home to GitHub; it is
     /// disabled unless explicitly enabled via CLI or global config.
@@ -1093,6 +1107,8 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(audit_log);
     c.env_pass.extend(local.env_pass);
     dedup_strings(&mut c.env_pass);
+    c.persistent_tmp.extend(local.persistent_tmp.clone());
+    dedup_strings(&mut c.persistent_tmp);
     c.env_from_file.extend(local.env_from_file);
     dedup_paths(&mut c.env_from_file);
     c.secret_hosts.extend(local.secret_hosts);
@@ -1447,6 +1463,12 @@ pub fn merge_with_global_report(
     if !local.env_pass.is_empty() {
         warnings.push(
             "project .ai-jail env_pass ignored (use --env or global config)"
+                .into(),
+        );
+    }
+    if !local.persistent_tmp.is_empty() {
+        warnings.push(
+            "project .ai-jail persistent_tmp ignored (use --persistent-tmp or global config)"
                 .into(),
         );
     }
@@ -1946,6 +1968,11 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
+
+    config
+        .persistent_tmp
+        .extend(cli.persistent_tmp.iter().cloned());
+    dedup_strings(&mut config.persistent_tmp);
 
     config
         .env_from_file
@@ -2571,6 +2598,50 @@ mod tests {
     }
 
     // ── Trusted capabilities: agent_state / env / update_check ──
+
+    #[test]
+    fn regression_v2_6_4_config_without_persistent_tmp() {
+        // Configs written before persistent_tmp existed must still
+        // parse, with the field defaulting to empty (and it must
+        // never round-trip into saved configs).
+        let toml = r#"
+command = ["claude"]
+env_pass = ["CI"]
+agent_state = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.persistent_tmp().is_empty());
+
+        let mut cfg = cfg.clone();
+        cfg.persistent_tmp = vec!["/tmp/jiti".into()];
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!saved.contains("persistent_tmp"));
+    }
+
+    #[test]
+    fn project_persistent_tmp_is_ignored_with_warning() {
+        let global = parse_toml("command = [\"claude\"]").unwrap();
+        let project =
+            parse_toml("persistent_tmp = [\"/tmp/jiti\"]\nlockdown = true")
+                .unwrap();
+        let (merged, warnings) =
+            merge_with_global_report(global, project, &std::env::temp_dir());
+        assert!(merged.persistent_tmp().is_empty());
+        // The unrelated tightening field still applies.
+        assert!(merged.lockdown_enabled());
+        assert!(warnings.iter().any(|w| w.contains("persistent_tmp")));
+    }
+
+    #[test]
+    fn cli_persistent_tmp_extends_global() {
+        let mut global =
+            parse_toml("persistent_tmp = [\"/tmp/jiti\"]").unwrap();
+        global.persistent_tmp.push("/tmp/node-compile-cache".into());
+        assert_eq!(
+            global.persistent_tmp(),
+            &["/tmp/jiti", "/tmp/node-compile-cache"]
+        );
+    }
 
     #[test]
     fn parse_trusted_capabilities_and_env_pass() {
@@ -3603,6 +3674,7 @@ no_gpu = true
             inherit_env: None,
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
             env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
+            persistent_tmp: vec!["/tmp/jiti".into()],
             secret_hosts: [(
                 "ANTHROPIC_API_KEY".to_string(),
                 "api.anthropic.com".to_string(),
@@ -6369,6 +6441,7 @@ hide_dotdirs = [".my_secrets"]
             inherit_env: None,
             env_pass: vec![],
             env_from_file: vec![],
+            persistent_tmp: vec!["/tmp/jiti".into()],
             secret_hosts: Default::default(),
             trust_project_config: vec![],
             update_check: None,

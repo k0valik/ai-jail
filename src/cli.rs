@@ -88,6 +88,10 @@ OPTIONS:
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)
+    --persistent-tmp <PATH>         Persist a /tmp leaf across launches by backing it
+                                    with a jail-owned store dir (repeatable; e.g.
+                                    /tmp/jiti, /tmp/node-compile-cache; trusted
+                                    config only, not persisted to .ai-jail)
     --secret <KEY=host>             Keep KEY's real value out of the sandbox: the child
                                     sees a placeholder; the egress proxy substitutes the
                                     real value only for requests to host (repeatable;
@@ -194,6 +198,11 @@ pub struct CliArgs {
     /// value only for requests terminating at `host`.
     pub secrets: Vec<(String, String)>,
     pub env: Vec<String>,
+    /// Persistent /tmp leaf paths (--persistent-tmp PATH, repeatable):
+    /// sandbox paths under /tmp backed by a jail-owned store dir so
+    /// their contents survive across launches (jiti / node-compile
+    /// caches). Trusted layers only; never persisted.
+    pub persistent_tmp: Vec<String>,
     pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
@@ -452,6 +461,17 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     );
                 }
                 args.env_from_file.push(PathBuf::from(path.into_owned()));
+            }
+            Long("persistent-tmp") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let path = val.to_string_lossy();
+                if path.is_empty() {
+                    return Err(
+                        "--persistent-tmp requires a non-empty /tmp path"
+                            .into(),
+                    );
+                }
+                args.persistent_tmp.push(path.into_owned());
             }
             Long("secret") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -723,6 +743,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--audit-verify",
     "--env",
     "--env-from-file",
+    "--persistent-tmp",
     "--secret",
     "--mise",
     "--no-mise",

@@ -1313,6 +1313,11 @@ pub fn build(
 
     opt_args.extend(mount_set.all_mount_args());
 
+    // Persistent /tmp leaves (after the discovered groups so the /tmp
+    // tmpfs from group 1 already exists; before the Landlock wrapper
+    // self-mount — disjoint paths).
+    opt_args.extend(persistent_tmp_mount_args(config)?);
+
     // Self binary mount for Landlock wrapper (after all other
     // mounts so /tmp tmpfs already exists)
     if let Some(ref wrapper_path) = wrapper {
@@ -1458,6 +1463,89 @@ fn proxy_socket_mount_args(
     }
 }
 
+// Persistent /tmp leaves: entries like "/tmp/jiti" are backed by a
+// jail-owned store directory so their contents survive across
+// launches. Emitted after the discovered mount groups (so the /tmp
+// tmpfs from group 1 already exists) and before the Landlock wrapper
+// self-mount (disjoint paths; order among the two is irrelevant).
+const PERSISTENT_TMP_ROOT: &str = ".local/share/ai-jail/persistent-tmp";
+
+/// Validate one persistent-tmp entry and return its sandbox destination.
+/// Only absolute paths under /tmp with simple components are accepted,
+/// so the store slug derived below can never escape the jail store.
+fn persistent_tmp_dest(entry: &str) -> Result<PathBuf, String> {
+    let invalid = || {
+        format!(
+            "persistent_tmp entry {entry:?} must be an absolute path under /tmp (e.g. /tmp/jiti)"
+        )
+    };
+    let rest = entry
+        .strip_prefix("/tmp/")
+        .filter(|rest| !rest.is_empty())
+        .ok_or_else(invalid)?;
+    let mut dest = PathBuf::from("/tmp");
+    for comp in rest.split('/') {
+        if comp.is_empty()
+            || comp == "."
+            || comp == ".."
+            || !comp.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+            })
+        {
+            return Err(invalid());
+        }
+        dest.push(comp);
+    }
+    Ok(dest)
+}
+
+/// Jail-store directory name backing a /tmp leaf: the validated path
+/// components joined, plus a short SHA-256 prefix so distinct paths
+/// ("/tmp/a__b" vs "/tmp/a/b") never collide in the store.
+fn persistent_tmp_slug(dest: &Path) -> String {
+    use sha2::Digest;
+    let joined = dest
+        .strip_prefix("/tmp")
+        .unwrap_or(dest)
+        .to_string_lossy()
+        .replace('/', "__");
+    let digest = sha2::Sha256::digest(dest.to_string_lossy().as_bytes());
+    format!(
+        "{joined}-{:08x}",
+        u32::from_be_bytes(digest[0..4].try_into().unwrap_or([0; 4]))
+    )
+}
+
+fn persistent_tmp_mount_args(config: &Config) -> Result<Vec<String>, String> {
+    if config.persistent_tmp().is_empty() {
+        return Ok(vec![]);
+    }
+    let root = super::home_dir().join(PERSISTENT_TMP_ROOT);
+    persistent_tmp_mount_args_at(&root, config)
+}
+
+fn persistent_tmp_mount_args_at(
+    root: &Path,
+    config: &Config,
+) -> Result<Vec<String>, String> {
+    if config.persistent_tmp().is_empty() {
+        return Ok(vec![]);
+    }
+    create_safe_overlay_dirs(std::slice::from_ref(&root)).map_err(|e| {
+        format!("cannot create persistent-tmp store {}: {e}", root.display())
+    })?;
+    let mut args = Vec::new();
+    for entry in config.persistent_tmp() {
+        let dest = persistent_tmp_dest(entry)?;
+        let base = root.join(persistent_tmp_slug(&dest));
+        create_safe_overlay_dirs(&[&base]).map_err(|e| {
+            format!("cannot create persistent-tmp dir {}: {e}", base.display())
+        })?;
+        args.extend(Mount::Bind { src: base, dest }.to_args());
+    }
+    Ok(args)
+}
+
 pub fn dry_run(
     guard: &SandboxGuard,
     config: &Config,
@@ -1507,6 +1595,9 @@ fn build_dry_run_args_full(
         vec![bwrap_binary_path()?.display().to_string()];
 
     args.extend(mount_set.all_mount_args());
+
+    // Persistent /tmp leaves (see build()); same ordering rationale.
+    args.extend(persistent_tmp_mount_args(config)?);
 
     // Self binary mount for Landlock wrapper
     let wrapper = resolve_landlock_wrapper(config)?;
@@ -4077,6 +4168,94 @@ mod tests {
         assert!(discover_kvm_at(&root.join("missing"), false).is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persistent_tmp_dest_validates_and_resolves() {
+        assert_eq!(
+            persistent_tmp_dest("/tmp/jiti").unwrap(),
+            PathBuf::from("/tmp/jiti")
+        );
+        assert_eq!(
+            persistent_tmp_dest("/tmp/a/b_c.d").unwrap(),
+            PathBuf::from("/tmp/a/b_c.d")
+        );
+        for bad in [
+            "jiti",
+            "/tmp",
+            "/tmp/",
+            "/",
+            "/var/jiti",
+            "/tmp/../escape",
+            "/tmp/./x",
+            "/tmp/a//b",
+            "/tmp/a b",
+            "/tmp/host:port",
+            "/tmp/x/..",
+            "/tmp/",
+        ] {
+            assert!(persistent_tmp_dest(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn persistent_tmp_slug_is_collision_free() {
+        let jiti = persistent_tmp_slug(Path::new("/tmp/jiti"));
+        assert!(jiti.starts_with("jiti-"));
+        assert!(jiti.len() > "jiti-".len());
+        // Distinct paths never map to the same store name, even when
+        // their underscore-joined forms would collide.
+        let a = persistent_tmp_slug(Path::new("/tmp/a__b"));
+        let b = persistent_tmp_slug(Path::new("/tmp/a/b"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("a__b-"));
+        assert!(b.starts_with("a__b-"));
+    }
+
+    #[test]
+    fn persistent_tmp_mounts_jail_store_leaf() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-ptmp-test-{}", std::process::id()));
+        let config = Config {
+            persistent_tmp: vec!["/tmp/jiti".into()],
+            ..minimal_test_config()
+        };
+        let args = persistent_tmp_mount_args_at(&root, &config).unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "--bind");
+        assert!(args[1].starts_with(&root.display().to_string()));
+        assert!(args[1].contains("jiti-"));
+        assert_eq!(args[2], "/tmp/jiti");
+        assert!(Path::new(&args[1]).is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persistent_tmp_dry_run_places_binds_after_tmpfs() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            persistent_tmp: vec!["/tmp/jiti".into()],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+        )
+        .unwrap();
+        let tmpfs_pos = args
+            .iter()
+            .position(|arg| arg == "/tmp")
+            .expect("/tmp tmpfs mount expected");
+        let bind_pos = args
+            .iter()
+            .position(|arg| arg.contains("persistent-tmp"))
+            .expect("persistent-tmp bind expected");
+        assert!(bind_pos > tmpfs_pos);
     }
 
     #[test]
