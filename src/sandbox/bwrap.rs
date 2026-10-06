@@ -1773,6 +1773,20 @@ fn discover_mounts_full(
         lockdown,
         verbose,
     );
+    // Bind destinations (agent state, dotdir passthrough, ...) already
+    // visible inside the sandbox: command-binary exemption paths beneath
+    // them are redundant, and re-binding goes through launcher symlinks
+    // (e.g. codex's current -> releases/<v>) that bwrap refuses to
+    // create mountpoints through.
+    let bound_dests: Vec<std::path::PathBuf> = home_dotfiles
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Bind { dest, .. } | Mount::RoBind { dest, .. } => {
+                Some(dest.clone())
+            }
+            _ => None,
+        })
+        .collect();
     // Overlay maps are opt-in and only meaningful when the sandbox
     // can write: disabled under lockdown (read-only) and browser mode.
     let (overlay_mounts_v, overlay_hide_v) = if lockdown || browser_mode {
@@ -1838,6 +1852,7 @@ fn discover_mounts_full(
                 config,
                 config.private_home_enabled(),
                 verbose,
+                &bound_dests,
             )
         } else {
             vec![]
@@ -2561,6 +2576,7 @@ fn discover_command_binary(
     config: &Config,
     private_home: bool,
     verbose: bool,
+    bound_dests: &[PathBuf],
 ) -> Vec<Mount> {
     let mut paths = if private_home {
         super::command_paths_under(config, &super::home_dir())
@@ -2578,6 +2594,11 @@ fn discover_command_binary(
     // dangling symlink until its versions dir is mounted (#138).
     let all = paths.clone();
     paths.retain(|p| !all.iter().any(|a| a != p && p.starts_with(a)));
+    // A path beneath an already-bound destination (agent state, dotdir
+    // passthrough) is visible in the sandbox already; re-binding it
+    // would chase launcher symlinks (codex's current -> releases/<v>)
+    // that bwrap cannot create mountpoints through.
+    paths.retain(|p| !bound_dests.iter().any(|a| p.starts_with(a)));
     paths
         .into_iter()
         .map(|path| {
@@ -5143,6 +5164,78 @@ mod tests {
         assert!(has_ro_bind(&args, &bin));
         assert!(has_ro_bind(&args, &versions));
         assert!(!has_ro_bind(&args, &bin.join("claude")));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_binary_skips_paths_under_agent_state_bind() {
+        // Regression (fork): codex lives at ~/.local/bin/codex ->
+        // ~/.codex/packages/standalone/current/bin/codex, where `current`
+        // is a symlink. agent_state binds all of ~/.codex read-write, so
+        // the exemption re-bind of the real binary dir is redundant —
+        // and bwrap refuses to create mountpoints through the `current`
+        // symlink ("Can't mkdir ... current/bin: No such file or
+        // directory"), killing the launch.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-cmd-agent-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        let version_dir =
+            home.join(".codex/packages/standalone/releases/0.160.1");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(version_dir.join("bin")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let exe = version_dir.join("bin/codex");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let standalone = home.join(".codex/packages/standalone");
+        std::os::unix::fs::symlink(&version_dir, standalone.join("current"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            standalone.join("current/bin/codex"),
+            bin.join("codex"),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", prepend_path(&bin));
+
+        let config = Config {
+            command: vec!["codex".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        // The agent-state bind covers the real binary dir...
+        let codex_dir = home.join(".codex").display().to_string();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == codex_dir)
+        );
+        // ...so the through-symlink re-bind must be gone, while the
+        // PATH-name ro-bind stays.
+        assert!(
+            !args.contains(
+                &standalone.join("current/bin").display().to_string()
+            )
+        );
+        assert!(has_ro_bind(&args, &bin.join("codex")));
 
         let _ = std::fs::remove_dir_all(&home);
     }
