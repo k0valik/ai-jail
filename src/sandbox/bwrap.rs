@@ -315,6 +315,13 @@ impl MountSet {
                     args.extend(["--setenv".into(), var.into(), val]);
                 }
             }
+            // Lockdown has no env_pass, so there is nothing a user
+            // override could collide with; force non-interactive git.
+            args.extend([
+                "--setenv".into(),
+                "GIT_TERMINAL_PROMPT".into(),
+                "0".into(),
+            ]);
         } else {
             for var in [
                 "SSH_AUTH_SOCK",
@@ -336,6 +343,25 @@ impl MountSet {
             // environment. Landlock-wrapper inner args are argv, not
             // environment, and are unaffected.
             args.extend(env_args(inherit_env, env_pass));
+            // Interactive credential prompts cannot work here: the
+            // jailed command shares the PTY with the user's TUI, so a
+            // prompt like `Username for 'https://github.com':` blocks
+            // forever and freezes the whole terminal. Force git to fail
+            // fast with a readable error instead. An explicit
+            // `--env GIT_TERMINAL_PROMPT=...` still wins: bwrap applies
+            // --setenv in order, so this is emitted only when the user
+            // did not name the variable.
+            let user_set_git_prompt = env_pass.iter().any(|entry| {
+                crate::config::parse_env_entry(entry)
+                    .is_ok_and(|(name, _)| name == "GIT_TERMINAL_PROMPT")
+            });
+            if !user_set_git_prompt {
+                args.extend([
+                    "--setenv".into(),
+                    "GIT_TERMINAL_PROMPT".into(),
+                    "0".into(),
+                ]);
+            }
             // Capability env must follow env_args, because that is what
             // carries --clearenv and bwrap drops every --setenv preceding
             // it. Emitted earlier, these were silently discarded while
@@ -6605,6 +6631,50 @@ mod tests {
     }
 
     // ── Sandbox environment filtering ───────────────────────────
+
+    #[test]
+    fn git_terminal_prompt_disabled_by_default() {
+        // An interactive git credential prompt (`Username for
+        // 'https://github.com':`) cannot be answered inside the sandbox:
+        // the jailed command shares the PTY with the user's TUI, so the
+        // prompt just freezes the terminal. git must fail fast instead.
+        fn setenv_values<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+            args.windows(3)
+                .filter(|w| w[0] == "--setenv" && w[1] == name)
+                .map(|w| w[2].as_str())
+                .collect()
+        }
+
+        let set = MountSet::default();
+        let args = set.isolation_args(Path::new("/p"), false, true, false, &[]);
+        assert_eq!(
+            setenv_values(&args, "GIT_TERMINAL_PROMPT"),
+            vec!["0"],
+            "normal mode: exactly one forced non-interactive default"
+        );
+
+        let args = set.isolation_args(Path::new("/p"), true, false, false, &[]);
+        assert_eq!(
+            setenv_values(&args, "GIT_TERMINAL_PROMPT"),
+            vec!["0"],
+            "lockdown: forced non-interactive default too"
+        );
+
+        // An explicit --env entry wins: the forced default is not
+        // emitted, so the user's value is the last --setenv applied.
+        let args = set.isolation_args(
+            Path::new("/p"),
+            false,
+            true,
+            false,
+            &["GIT_TERMINAL_PROMPT=1".into()],
+        );
+        assert_eq!(
+            setenv_values(&args, "GIT_TERMINAL_PROMPT"),
+            vec!["1"],
+            "explicit --env override must survive"
+        );
+    }
 
     #[test]
     fn capability_env_survives_clearenv() {
