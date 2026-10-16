@@ -1546,10 +1546,17 @@ pub fn save(config: &Config) {
 
 /// Auto-save variant used by ordinary runs.
 ///
-/// Writes nothing when the project config would carry no settings at all, so
-/// a plain first run in a clean directory no longer leaves a comment-only
+/// Writes nothing when the project config would carry no settings at all,
+/// so a plain first run in a clean directory no longer leaves a comment-only
 /// `.ai-jail` behind (issue #103). `--init` still writes that file, because
 /// there the user explicitly asked for one to edit.
+///
+/// Fork divergence: a config whose only content is the remembered
+/// `command` also writes nothing when no `.ai-jail` exists yet — a plain
+/// `ai-jail pi` in every repo should not litter project roots with
+/// near-empty files. An existing file is still updated (the user opted in
+/// by having one), so bare `ai-jail` keeps re-running the remembered
+/// command where a config is already present.
 pub fn save_auto(config: &Config) {
     save_project(config, false);
 }
@@ -1568,8 +1575,15 @@ fn save_project(config: &Config, write_when_empty: bool) {
     // this into a project file where it would be silently ignored.
     local.trust_project_config.clear();
 
-    if !write_when_empty && config_body_is_empty(&local) {
-        return;
+    if !write_when_empty {
+        if config_body_is_empty(&local) {
+            return;
+        }
+        // Fork divergence (see save_auto): a command-only config does not
+        // create a new .ai-jail; it only updates one that already exists.
+        if config_body_is_command_only(&local) && !config_path().exists() {
+            return;
+        }
     }
     save_to_path(&config_path(), &local);
 }
@@ -1580,6 +1594,15 @@ fn config_body_is_empty(config: &Config) -> bool {
     toml::to_string_pretty(config)
         .map(|body| body.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// Whether the only non-default setting is the remembered `command`.
+/// Such a config carries no sandbox policy at all — writing it to a clean
+/// directory just records which agent was launched there (fork litter).
+fn config_body_is_command_only(config: &Config) -> bool {
+    let mut without_command = config.clone();
+    without_command.command.clear();
+    config_body_is_empty(&without_command)
 }
 
 /// Persist user-level preferences (status bar) to `$HOME/.ai-jail`.
@@ -6025,7 +6048,10 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
         // The project directory is mounted read-write, so a target inside
         // it could be rewritten by the agent the policy constrains. Tests
         // run with the crate root as the working directory, so a file
-        // created here is inside the "project" for this check.
+        // created here is inside the "project" for this check. Hold
+        // CWD_LOCK: this test reads current_dir(), so a concurrent
+        // set_current_dir test would relocate (and delete) its probe.
+        let _cwd = CWD_LOCK.lock().unwrap();
         let target = std::env::current_dir()
             .unwrap()
             .join(format!(".ai-jail-symlink-probe-{}", std::process::id()));
@@ -6235,12 +6261,85 @@ network = true
             lockdown: Some(true),
             ..Config::default()
         }));
-        // A recorded command is a real setting, so ordinary runs that name
-        // one still save.
+        // A recorded command is a real setting (the body is not empty),
+        // but as the only setting it gets its own fork-local skip — see
+        // auto_save_does_not_create_a_command_only_config.
         assert!(!config_body_is_empty(&Config {
             command: vec!["claude".into()],
             ..Config::default()
         }));
+        assert!(config_body_is_command_only(&Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        }));
+        // Command plus any real setting is not command-only.
+        assert!(!config_body_is_command_only(&Config {
+            command: vec!["claude".into()],
+            no_gpu: Some(true),
+            ..Config::default()
+        }));
+    }
+
+    #[test]
+    fn auto_save_does_not_create_a_command_only_config() {
+        // Fork divergence: `ai-jail pi` in a clean directory must not
+        // litter the project root with a .ai-jail whose only content is
+        // the remembered command.
+        let _cwd = CWD_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-cmd-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        save_auto(&Config {
+            command: vec!["pi".into()],
+            ..Config::default()
+        });
+        assert!(!dir.join(".ai-jail").exists());
+
+        // An existing file is still updated, so bare `ai-jail` keeps
+        // re-running the remembered command where a config exists.
+        save(&Config {
+            command: vec!["pi".into()],
+            ..Config::default()
+        });
+        assert!(dir.join(".ai-jail").exists());
+        save_auto(&Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        });
+        let on_disk = std::fs::read_to_string(dir.join(".ai-jail")).unwrap();
+        assert!(on_disk.contains("claude"), "got:\n{on_disk}");
+
+        std::env::set_current_dir(&original_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_save_writes_real_settings_even_without_an_existing_file() {
+        // The command-only skip must not swallow configs that carry
+        // actual sandbox policy.
+        let _cwd = CWD_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-cmd-plus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        save_auto(&Config {
+            command: vec!["pi".into()],
+            no_gpu: Some(true),
+            ..Config::default()
+        });
+        assert!(dir.join(".ai-jail").exists());
+        let on_disk = std::fs::read_to_string(dir.join(".ai-jail")).unwrap();
+        assert!(on_disk.contains("no_gpu"), "got:\n{on_disk}");
+
+        std::env::set_current_dir(&original_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
