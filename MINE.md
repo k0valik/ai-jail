@@ -31,6 +31,9 @@ spend effort on cross-platform concerns here; do not upstream anything.
 | `feat(sandbox): persistent /tmp leaves` | new `persistent_tmp` config field + `--persistent-tmp` flag | fresh `/tmp` per launch re-transpiles pi extensions every start; jiti/node-compile caches now persist in a jail-owned store |
 | `fix(sandbox): drop command-binary re-binds beneath agent-state mounts` | group-14 exemption filtered against agent-state binds | codex's auto-update symlink (`current -> releases/<v>`) made bwrap refuse the mountpoint; killed every codex launch |
 | `fix(sandbox): prefer /usr/local/bin/bwrap` | candidate order | local bwrap builds must override the distro package |
+| `fix(pty): forward OSC 52 clipboard writes without terminal passthrough` | `OscForwarder` set/query split | jailed fullscreen TUIs (pi) had no copy/yank at all: OSC 52 was the only clipboard path (no DISPLAY inside) and the forwarder dropped it unless `--terminal-passthrough`; sets now always forward, clipboard-read queries stay gated |
+| `fix(config): auto-save no longer creates command-only .ai-jail files` | `save_auto` command-only skip | upstream persists the positional command so bare `ai-jail` remembers the agent — that littered every project root with near-empty `.ai-jail` files; we only skip *creating* them, existing files still update |
+| `fix(sandbox): force GIT_TERMINAL_PROMPT=0 in the sandbox` | forced setenv (normal + lockdown) | git's interactive `Username for 'https://github.com':` prompt runs on the PTY the jailed TUI owns → frozen terminal; now git fails fast; explicit `--env GIT_TERMINAL_PROMPT=...` still wins |
 
 ## persistent_tmp (the one fork feature)
 
@@ -139,6 +142,13 @@ audio needs `--audio`.
 - `tests/sandbox_escape.rs::netlink_route_is_blocked_without_network`
   fails on pristine upstream too on this host (WSL kernel/seccomp
   interaction). Pre-existing, not ours; ignore in test runs.
+- `sandbox::bwrap::tests::persistent_tmp_dry_run_places_binds_after_tmpfs`
+  is flaky on pristine upstream too (pid-named fake-home dirs in /tmp
+  racing across test binaries). Pre-existing, not ours.
 - pi 0.87: the `/tmp/jiti` leaf is currently unused (see above).
 - `ai-jail status` and `--init` write per-project `.ai-jail` files; keep
-  them tightening-only (they are untrusted by design).
+  them tightening-only (they are untrusted by design). Ordinary runs no
+  longer create one just to remember the command (see divergence table).
+- For real GitHub auth inside the jail use `--github` (read-only
+  `~/.config/gh`) and/or `--env GITHUB_TOKEN`; git now fails fast
+  instead of prompting.
