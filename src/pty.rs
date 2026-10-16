@@ -366,10 +366,12 @@ impl<'a> IoLoop<'a> {
         // string but never re-emits it via state_diff / state_formatted,
         // so on the alt screen a fullscreen TUI loses its window-title
         // updates (OSC 0/1/2 — the tab keeps showing the launch command
-        // instead of "opencode", #57), clipboard writes (OSC 52), and
-        // color queries (OSC 10/11/12). The primary screen's raw
-        // pass-through carries these natively.
-        if now_alt {
+        // instead of "opencode", #57) and its clipboard writes (OSC 52 —
+        // copy/yank, #55). The primary screen's raw pass-through
+        // (terminal passthrough) carries these natively; the filtered
+        // primary path drops them, so it feeds the forwarder too. Query
+        // forms stay gated on passthrough (see OscForwarder).
+        if now_alt || !self.terminal_passthrough {
             self.osc.feed(self.stdout, buf);
         }
 
@@ -880,11 +882,14 @@ impl TerminalFilter {
 /// input.
 const OSC_MAX_LEN: usize = 1 << 20;
 
-/// OSC command numbers forwarded unconditionally (set or query) when
-/// vt100 swallows them on the alt screen:
+/// OSC command numbers whose *set* forms are forwarded unconditionally
+/// when vt100 swallows them on the alt screen:
 ///   - 0/1/2 — set icon name / window title. Without forwarding, a
 ///     fullscreen TUI's tab title never updates (opencode, #57).
-///   - 52    — clipboard manipulation (copy / query).
+///   - 52    — clipboard write (the TUI copy/yank feature, #55). The
+///     *query* form of 52 — clipboard read-back — is handled separately
+///     in [`OscForwarder::is_forwardable`] and stays gated behind the
+///     explicit `--terminal-passthrough` opt-in.
 ///
 /// Color commands (OSC 10/11/12) are handled separately in
 /// [`OscForwarder::is_forwardable`] — only their *query* form is
@@ -913,21 +918,31 @@ enum OscState {
 /// real terminal when `<cmd>` is forwardable (see
 /// [`OscForwarder::is_forwardable`]).
 ///
+/// Set forms (title 0/1/2, clipboard write 52) forward unconditionally:
+/// they are ordinary TUI output to the *user's own* terminal, and
+/// without them a jailed fullscreen agent cannot copy/yank at all (its
+/// `DISPLAY`/`WAYLAND_DISPLAY` are absent, so OSC 52 is the only
+/// clipboard path). Query forms — clipboard read-back (52 `?`) and
+/// color queries (10/11/12 `?`) — make the *real terminal* reply into
+/// the sandbox, so they stay behind the explicit `--terminal-passthrough`
+/// opt-in.
+///
 /// State persists across reads on purpose: a base64 OSC 52 selection
 /// can easily exceed a single 8 KiB read, so a stateless per-read scan
 /// (like [`forward_terminal_queries`]) would miss split sequences.
 struct OscForwarder {
     state: OscState,
     buf: Vec<u8>,
-    enabled: bool,
+    /// Whether query-form OSC may be forwarded (terminal passthrough).
+    queries_enabled: bool,
 }
 
 impl OscForwarder {
-    fn new(enabled: bool) -> Self {
+    fn new(queries_enabled: bool) -> Self {
         Self {
             state: OscState::Ground,
             buf: Vec::new(),
-            enabled,
+            queries_enabled,
         }
     }
 
@@ -937,9 +952,10 @@ impl OscForwarder {
     }
 
     /// Forward the captured sequence only if its OSC command number is
-    /// in the allowlist; always reset afterwards.
+    /// in the allowlist (and query forms are permitted); always reset
+    /// afterwards.
     fn flush(&mut self, fd: i32) {
-        if self.enabled && Self::is_forwardable(&self.buf) {
+        if Self::is_forwardable(&self.buf, self.queries_enabled) {
             write_all_raw(fd, &self.buf);
         }
         self.reset();
@@ -947,20 +963,38 @@ impl OscForwarder {
 
     /// Inspect a captured `ESC ] <cmd> (;|terminator) …` buffer and
     /// decide whether `<cmd>` is one we forward.
-    fn is_forwardable(buf: &[u8]) -> bool {
+    fn is_forwardable(buf: &[u8], queries_enabled: bool) -> bool {
         // Strip the leading "\x1b]" introducer.
         let body = match buf.strip_prefix(b"\x1b]") {
             Some(b) => b,
             None => return false,
         };
-        // The command number runs up to the first ';' (or the
-        // terminator, for parameter-less commands).
-        let end = body
-            .iter()
-            .position(|&b| b == b';' || b == 0x07 || b == 0x1b)
-            .unwrap_or(body.len());
+        // Drop the trailing terminator (BEL or ST) so the parameter
+        // inspection below never sees it.
+        let body = body
+            .strip_suffix(b"\x07")
+            .or_else(|| body.strip_suffix(b"\x1b\\"))
+            .unwrap_or(body);
+        // The command number runs up to the first ';' (or the end, for
+        // parameter-less commands).
+        let end = body.iter().position(|&b| b == b';').unwrap_or(body.len());
         let cmd = &body[..end];
         if OSC_FORWARD_CMDS.contains(&cmd) {
+            // OSC 52 is dual-use: a *set* (`52;<sel>;<base64>`) writes
+            // the child's data to the user's clipboard — the copy/yank
+            // feature — while a *query* (`52;<sel>;?`) asks the terminal
+            // to send clipboard contents back into the sandbox. The set
+            // forwards unconditionally; the query needs the explicit
+            // terminal-passthrough opt-in. The payload is the last
+            // `;`-separated component (`52;c;?`, `52;;?`, `52;?`).
+            if cmd == b"52" {
+                let payload = body.get(end + 1..).unwrap_or_default();
+                let last_sep =
+                    payload.iter().rposition(|&b| b == b';').map(|i| i + 1);
+                let last = &payload[last_sep.unwrap_or(0)..];
+                let is_query = last == b"?";
+                return !is_query || queries_enabled;
+            }
             return true;
         }
         // Color commands (fg/bg/cursor). Forward only the *query* form
@@ -969,7 +1003,8 @@ impl OscForwarder {
         // 110/111/112) is not forwarded, so a set would leak past the
         // child's exit. The query reply round-trips via our stdin.
         if matches!(cmd, b"10" | b"11" | b"12") {
-            return body.get(end) == Some(&b';')
+            return queries_enabled
+                && body.get(end) == Some(&b';')
                 && body.get(end + 1) == Some(&b'?');
         }
         false
@@ -1503,8 +1538,12 @@ mod tests {
     }
 
     fn capture_osc52(chunks: &[&[u8]]) -> Vec<u8> {
+        capture_osc52_with(chunks, true)
+    }
+
+    fn capture_osc52_with(chunks: &[&[u8]], queries_enabled: bool) -> Vec<u8> {
         let (r, w) = nix::unistd::pipe().unwrap();
-        let mut fwd = super::OscForwarder::new(true);
+        let mut fwd = super::OscForwarder::new(queries_enabled);
         for chunk in chunks {
             fwd.feed(w.as_raw_fd(), chunk);
         }
@@ -1562,12 +1601,16 @@ mod tests {
     #[test]
     fn osc_color_query_forwarded() {
         // OSC 11 (background color) query — TUIs adapt their palette
-        // from the reply, which round-trips via our stdin.
+        // from the reply, which round-trips via our stdin. Query forms
+        // need terminal passthrough.
         let q = b"\x1b]11;?\x07";
-        assert_eq!(capture_osc52(&[q]), q);
+        assert_eq!(capture_osc52_with(&[q], true), q);
         // OSC 10 (foreground) and OSC 12 (cursor) queries too.
         let q10 = b"\x1b]10;?\x1b\\";
-        assert_eq!(capture_osc52(&[q10]), q10);
+        assert_eq!(capture_osc52_with(&[q10], true), q10);
+        // Without passthrough the reply would flow into the sandbox:
+        // denied.
+        assert!(capture_osc52_with(&[q], false).is_empty());
     }
 
     #[test]
@@ -1602,13 +1645,28 @@ mod tests {
     }
 
     #[test]
-    fn osc_title_and_clipboard_denied_without_passthrough() {
-        let (r, w) = nix::unistd::pipe().unwrap();
-        let mut fwd = super::OscForwarder::new(false);
-        fwd.feed(w.as_raw_fd(), b"\x1b]2;title\x07\x1b]52;c;data\x07");
-        drop(w);
-        let mut out = [0; 1];
-        assert_eq!(nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0), 0);
+    fn osc_set_forms_forwarded_without_passthrough() {
+        // Titles (0/1/2) and clipboard writes (52 set) are ordinary TUI
+        // output for the user's own terminal, and a jailed agent has no
+        // DISPLAY/WAYLAND_DISPLAY — OSC 52 is its only copy/yank path
+        // (#55). They must forward without --terminal-passthrough.
+        let title = b"\x1b]2;pi session\x07";
+        let set = b"\x1b]52;c;aGVsbG8=\x07";
+        let data = [title.as_slice(), set.as_slice()].concat();
+        assert_eq!(capture_osc52_with(&[&data], false), data);
+    }
+
+    #[test]
+    fn osc52_query_denied_without_passthrough() {
+        // The query form asks the terminal to send the host clipboard
+        // back into the sandbox — a read of host state, so it stays
+        // behind the explicit --terminal-passthrough opt-in.
+        assert!(capture_osc52_with(&[b"\x1b]52;c;?\x07"], false).is_empty());
+        // Selection-less and multi-selection query forms too.
+        assert!(capture_osc52_with(&[b"\x1b]52;?\x07"], false).is_empty());
+        assert!(capture_osc52_with(&[b"\x1b]52;;?\x07"], false).is_empty());
+        // ST-terminated query as well.
+        assert!(capture_osc52_with(&[b"\x1b]52;c;?\x1b\\"], false).is_empty());
     }
 
     #[test]
