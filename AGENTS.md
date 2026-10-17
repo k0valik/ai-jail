@@ -5,7 +5,8 @@
 > read [MINE.md](MINE.md) — it is the authoritative divergence manifest
 > (what we changed and why, host prerequisites, config, upstream-merge
 > workflow). Scope: WSL2 and pure Linux only; macOS, packaging, and
-> CI/release are out of scope. Never open upstream issues or PRs.
+> build/test/release CI are out of scope. Fork-maintenance sync automation is
+> in scope. Never open upstream issues or PRs.
 
 ## What This Project Is
 

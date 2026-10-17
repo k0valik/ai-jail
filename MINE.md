@@ -7,18 +7,26 @@ what we changed, why, and how to keep upstream merges painless.
 ## Scope
 
 **This fork targets WSL2 and pure Linux only.** macOS/Darwin (seatbelt
-backend), AUR/Homebrew packaging, release signing, and GitHub CI/releases
-are explicitly out of scope and were removed or are simply ignored. Do not
-spend effort on cross-platform concerns here; do not upstream anything.
+backend), AUR/Homebrew packaging, release signing, and build/test/release CI
+are explicitly out of scope and were removed or are simply ignored. The one
+GitHub Actions workflow is fork maintenance: it syncs `master` from upstream
+and opens or refreshes a PR into `mine`. Do not spend effort on
+cross-platform concerns here; do not upstream anything.
 
 ## Relationship to upstream
 
 - `origin` = `https://github.com/k0valik/ai-jail` (default branch: `mine`)
 - `upstream` = `https://github.com/akitaonrails/ai-jail`
 - **NEVER open upstream issues or PRs.** Changes live on `mine` only.
-- Track upstream: `git fetch upstream && git merge upstream/master` into
-  `mine`. Our touch points are small and additive, so conflicts should be
-  rare. The files we deliberately touched upstream-hot code in:
+- `master` tracks upstream `master`. The `upstream-sync` Actions workflow
+  fast-forwards fork `master` and opens or refreshes a PR into `mine`; review
+  and merge that PR to integrate upstream changes into the fork. Locally, run
+  `scripts/sync-upstream.sh` for a dry run or use `--push --pr --pr-base mine`
+  to publish the update.
+- To run the hosted workflow, enable GitHub Actions for this repository and
+  allow Actions to create pull requests under Settings → Actions → General.
+- Our touch points are small and additive, so conflicts should be rare. The
+  files we deliberately touched upstream-hot code in:
   `src/sandbox/bwrap.rs` (two small insertions), `src/sandbox/mod.rs`
   (nothing yet), `src/cli.rs` + `src/config.rs` (one field each).
 
@@ -27,13 +35,14 @@ spend effort on cross-platform concerns here; do not upstream anything.
 | Commit | Change | Why |
 | --- | --- | --- |
 | `rename CLAUDE.md to AGENTS.md` | agent-agnostic guideline file | cross-agent (pi, codex, ...) |
-| `chore(ci): remove GitHub Actions workflows` | no CI/release runners | local builds only; Actions also disabled at repo level |
+| `chore(ci): remove GitHub Actions workflows` | no build/release CI runners | local builds only; fork-maintenance sync is the sole Actions workflow |
 | `feat(sandbox): persistent /tmp leaves` | new `persistent_tmp` config field + `--persistent-tmp` flag | fresh `/tmp` per launch re-transpiles pi extensions every start; jiti/node-compile caches now persist in a jail-owned store |
 | `fix(sandbox): drop command-binary re-binds beneath agent-state mounts` | group-14 exemption filtered against agent-state binds | codex's auto-update symlink (`current -> releases/<v>`) made bwrap refuse the mountpoint; killed every codex launch |
 | `fix(sandbox): prefer /usr/local/bin/bwrap` | candidate order | local bwrap builds must override the distro package |
 | `fix(pty): forward OSC 52 clipboard writes without terminal passthrough` | `OscForwarder` set/query split | jailed fullscreen TUIs (pi) had no copy/yank at all: OSC 52 was the only clipboard path (no DISPLAY inside) and the forwarder dropped it unless `--terminal-passthrough`; sets now always forward, clipboard-read queries stay gated |
 | `fix(config): auto-save no longer creates command-only .ai-jail files` | `save_auto` command-only skip | upstream persists the positional command so bare `ai-jail` remembers the agent — that littered every project root with near-empty `.ai-jail` files; we only skip *creating* them, existing files still update |
 | `fix(sandbox): force GIT_TERMINAL_PROMPT=0 in the sandbox` | forced setenv (normal + lockdown) | git's interactive `Username for 'https://github.com':` prompt runs on the PTY the jailed TUI owns → frozen terminal; now git fails fast; explicit `--env GIT_TERMINAL_PROMPT=...` still wins |
+| `chore(fork): add scheduled upstream sync` | `.github/workflows/sync-upstream.yml`, `scripts/sync-upstream.sh`, `scripts/validate-sync.sh` | keep fork `master` fast-forwarded to upstream and maintain a review PR into `mine` |
 
 ## persistent_tmp (the one fork feature)
 

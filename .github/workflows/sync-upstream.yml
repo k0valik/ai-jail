@@ -1,0 +1,37 @@
+name: upstream-sync
+
+# Keep this fork's master branch as a fast-forward mirror of upstream/master,
+# then open or refresh a review PR from master into mine.
+# Repository settings must enable Actions and allow Actions to create pull requests.
+on:
+  schedule:
+    - cron: '17 3 */3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out mine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: mine
+          fetch-depth: 0
+
+      - name: Validate sync setup
+        run: scripts/validate-sync.sh
+
+      - name: Sync upstream and refresh pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: scripts/sync-upstream.sh --push --pr --pr-base mine
