@@ -172,6 +172,10 @@ struct MountSet {
     base: Vec<Mount>,
     sys_masks: Vec<Mount>,
     home_dotfiles: Vec<Mount>,
+    devin_env: Vec<(String, String)>,
+    /// Devin state roots are read-write; the installation below its data
+    /// root is remounted read-only afterward.
+    devin_state: Vec<Mount>,
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
     local_overrides: Vec<Mount>,
@@ -194,8 +198,8 @@ struct MountSet {
     ssh_env: Vec<(String, String)>,
     claude_env: Vec<(String, String)>,
     /// Forced proxy environment in filtered-egress mode
-    /// (http_proxy/https_proxy/all_proxy + an emptied no_proxy), empty
-    /// otherwise.
+    /// (http_proxy/https_proxy/all_proxy + a no_proxy that names only
+    /// loopback, and only when a port is forwarded), empty otherwise.
     proxy_env: Vec<(String, String)>,
     pictures: Vec<Mount>,
     browser_state: Vec<Mount>,
@@ -206,6 +210,7 @@ struct MountSet {
     /// project directory. Applied after the project bind — bwrap gives
     /// the later mount precedence, so emitting these earlier would let
     /// the read-write project bind silently shadow them (#83).
+    devin_state_inside: Vec<Mount>,
     extra_inside: Vec<Mount>,
     /// `--overlay-map` mounts inside the project directory; same
     /// shadowing rule as `extra_inside` (#83). Without this, writes
@@ -220,7 +225,14 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 27] {
+    fn landlock_map_mounts(&self) -> impl Iterator<Item = &Mount> {
+        self.devin_state
+            .iter()
+            .chain(self.devin_state_inside.iter())
+            .chain(self.extra.iter())
+            .chain(self.extra_inside.iter())
+    }
+    fn ordered_mounts(&self) -> [&[Mount]; 29] {
         [
             &self.base,
             &self.sys_masks,
@@ -233,6 +245,7 @@ impl MountSet {
             &self.audio,
             &self.systemd_user,
             &self.home_dotfiles,
+            &self.devin_state,
             &self.config_hide,
             &self.cache_hide,
             &self.local_overrides,
@@ -244,6 +257,7 @@ impl MountSet {
             &self.extra,
             &self.overlay,
             &self.project,
+            &self.devin_state_inside,
             &self.extra_inside,
             &self.overlay_inside,
             &self.mask,
@@ -401,13 +415,18 @@ impl MountSet {
             args.push(key.clone());
             args.push(val.clone());
         }
+        if !lockdown {
+            for (key, val) in &self.devin_env {
+                args.extend(["--setenv".into(), key.clone(), val.clone()]);
+            }
+        }
 
         // Filtered egress proxy env (always, even in lockdown). Must
         // follow env_args like the other capability env (#122): bwrap
         // applies --setenv in order, so these forced values also win
         // over a user-supplied `--env http_proxy=...` -- in filtered
         // mode the child must not be told to use a different proxy,
-        // and the emptied no_proxy must not exempt anything.
+        // and no_proxy must not exempt anything beyond loopback.
         for (key, val) in &self.proxy_env {
             args.push("--setenv".into());
             args.push(key.clone());
@@ -429,9 +448,11 @@ impl MountSet {
 
 /// bwrap environment arguments for normal (non-lockdown) mode.
 ///
-/// Full inheritance (`--inherit-env`) keeps the host environment as
-/// bwrap would by default, with env_pass entries forced verbatim via
-/// `--setenv` (winning over the `--unsetenv` hardening above). The
+/// Full inheritance (`--inherit-env`) recreates the host environment through
+/// explicit `--setenv` arguments, with env_pass entries forced verbatim
+/// (winning over the inherited values). The outer bwrap process itself is
+/// launched with an empty environment so host-only values are not readable
+/// through its `/proc/<pid>/environ`. The
 /// default filters to the safe allowlist: `--clearenv` followed by a
 /// `--setenv` per kept variable.
 ///
@@ -444,7 +465,7 @@ fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
     let host_env: Vec<(String, String)> = std::env::vars().collect();
     let mut args = Vec::new();
     if inherit_env {
-        let mut env = Vec::new();
+        let mut env = host_env.clone();
         crate::config::apply_env_pass(&mut env, env_pass, &host_env);
         for (name, value) in env {
             args.extend(["--setenv".into(), name, value]);
@@ -456,8 +477,34 @@ fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
         {
             args.extend(["--setenv".into(), name, value]);
         }
+        for (name, value) in login_name_env(env_pass) {
+            args.extend(["--setenv".into(), name.into(), value]);
+        }
     }
     args
+}
+
+/// `USER` and `LOGNAME` for the filtered environment, from the passwd
+/// entry of the invoking uid: the same name `whoami`, `id -un` and the
+/// shell prompt already read from the jail's `/etc/passwd`, so this
+/// exposes nothing new. Without them, everything that reads `$USER`
+/// (`/tmp/$USER` paths, the `psql` default role, shell prompts and
+/// titles) sees an empty name. A name chosen with `--env` wins.
+fn login_name_env(env_pass: &[String]) -> Vec<(&'static str, String)> {
+    let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid())
+    else {
+        return Vec::new();
+    };
+    ["USER", "LOGNAME"]
+        .into_iter()
+        .filter(|var| {
+            !env_pass.iter().any(|entry| {
+                crate::config::parse_env_entry(entry)
+                    .is_ok_and(|(name, _)| name == *var)
+            })
+        })
+        .map(|var| (var, user.name.clone()))
+        .collect()
 }
 
 struct MountSources<'a> {
@@ -643,10 +690,11 @@ fn self_binary_path() -> Option<PathBuf> {
 
 pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     let mut override_error: Option<String> = None;
+    let mut rejected: Vec<(PathBuf, String)> = Vec::new();
 
     if let Some(raw) = std::env::var_os(BWRAP_ENV_VAR) {
         let p = PathBuf::from(raw);
-        if let Some(path) = trusted_bwrap_path(&p) {
+        if let Some(path) = trusted_bwrap_candidate(&p, &mut rejected) {
             return Ok(path);
         }
         output::security_warn(
@@ -660,7 +708,7 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
 
     for candidate in BWRAP_CANDIDATES {
         let p = PathBuf::from(candidate);
-        if let Some(path) = trusted_bwrap_path(&p) {
+        if let Some(path) = trusted_bwrap_candidate(&p, &mut rejected) {
             return Ok(path);
         }
     }
@@ -668,24 +716,47 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("bwrap");
-            if let Some(path) = trusted_bwrap_path(&candidate) {
+            if let Some(path) =
+                trusted_bwrap_candidate(&candidate, &mut rejected)
+            {
                 return Ok(path);
             }
         }
     }
 
-    let mut msg = String::from(
-        "bwrap (bubblewrap) not found in trusted locations. Install it:\n  \
-         Arch: pacman -S bubblewrap\n  \
-         Debian/Ubuntu: apt install bubblewrap\n  \
-         Fedora: dnf install bubblewrap\n\
-         Or set BWRAP_BIN=/absolute/path/to/bwrap",
-    );
+    Err(bwrap_lookup_error(&rejected, override_error))
+}
+
+fn bwrap_lookup_error(
+    rejected: &[(PathBuf, String)],
+    override_error: Option<String>,
+) -> String {
+    let mut msg = if rejected.is_empty() {
+        String::from(
+            "bwrap (bubblewrap) not found in trusted locations. Install it:\n  \
+             Arch: pacman -S bubblewrap\n  \
+             Debian/Ubuntu: apt install bubblewrap\n  \
+             Fedora: dnf install bubblewrap\n\
+             Or set BWRAP_BIN=/absolute/path/to/bwrap",
+        )
+    } else {
+        let mut msg = String::from(
+            "bwrap (bubblewrap) was found but failed trusted binary \
+             validation. ai-jail only runs a bwrap that is an executable \
+             file owned by root (or in a protected Nix store) and not \
+             writable by group or others:",
+        );
+        for (_, line) in rejected {
+            msg.push_str("\n  ");
+            msg.push_str(line);
+        }
+        msg
+    };
     if let Some(err) = override_error {
         msg.push('\n');
         msg.push_str(&err);
     }
-    Err(msg)
+    msg
 }
 
 /// Use --new-session only when stdin is NOT a terminal.
@@ -710,18 +781,81 @@ fn should_use_new_session() -> bool {
     !crate::statusbar::is_active() && !std::io::stdin().is_terminal()
 }
 
-fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
+/// Returns the canonical path when `path` is a trusted bwrap. A candidate
+/// that exists but is refused is recorded in `rejected` (once per canonical
+/// path) with the reason, so the final error can say it was found rather
+/// than "not found".
+fn trusted_bwrap_candidate(
+    path: &Path,
+    rejected: &mut Vec<(PathBuf, String)>,
+) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
     let in_nix_store = canonical.starts_with(NIX_STORE)
         && nix_store_is_protected(Path::new(NIX_STORE));
-    trusted_binary_metadata(
+    let (is_file, uid, mode) = (
         metadata.file_type().is_file(),
         metadata.uid(),
         metadata.mode(),
-        in_nix_store,
-    )
-    .then_some(canonical)
+    );
+    if trusted_binary_metadata(is_file, uid, mode, in_nix_store) {
+        return Some(canonical);
+    }
+    if rejected.iter().any(|(seen, _)| *seen == canonical) {
+        return None;
+    }
+
+    let shown = if canonical == path {
+        path.display().to_string()
+    } else {
+        format!("{} -> {}", path.display(), canonical.display())
+    };
+    let line = format!(
+        "{shown}: {}",
+        untrusted_binary_reason(
+            is_file,
+            uid,
+            mode,
+            in_nix_store,
+            overflow_uid()
+        )
+    );
+    rejected.push((canonical, line));
+    None
+}
+
+/// The kernel's overflow uid: what `stat` reports, inside a user
+/// namespace, for an owner that namespace does not map (usually 65534).
+fn overflow_uid() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Why `trusted_binary_metadata` refused a binary, for the error message.
+fn untrusted_binary_reason(
+    is_file: bool,
+    uid: u32,
+    mode: u32,
+    in_nix_store: bool,
+    overflow_uid: Option<u32>,
+) -> String {
+    let perms = mode & 0o7777;
+    if !is_file {
+        "not a regular file".into()
+    } else if mode & 0o111 == 0 {
+        format!("not executable (mode {perms:04o})")
+    } else if uid == 0 || in_nix_store {
+        format!("writable by group or others (mode {perms:04o})")
+    } else if overflow_uid == Some(uid) {
+        format!(
+            "owned by uid {uid} (the overflow uid), not root. Inside a user \
+             namespace that does not map root, such as a rootless \
+             container, a root-owned file shows up as this uid"
+        )
+    } else {
+        format!("owned by uid {uid}, not root")
+    }
 }
 
 /// Whether the Nix store itself is beyond the reach of whoever runs
@@ -735,7 +869,8 @@ fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
 /// safe — a member may create new store paths but cannot replace someone
 /// else's — so `nix_store_metadata_is_protected` explicitly requires it on
 /// group-writable stores. A store owned by a non-root user (e.g. a single-user
-/// install) must carry no write bits at all.
+/// install) is never protected: its owner can restore write permission even
+/// when the current mode has no write bits.
 fn nix_store_is_protected(store: &Path) -> bool {
     store.metadata().is_ok_and(|m| {
         m.is_dir() && nix_store_metadata_is_protected(m.uid(), m.mode())
@@ -749,11 +884,7 @@ fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
         return false;
     }
 
-    if uid == 0 || uid == 65534 {
-        mode & 0o002 == 0
-    } else {
-        mode & 0o222 == 0
-    }
+    (uid == 0 || uid == 65534) && mode & 0o002 == 0
 }
 
 fn trusted_binary_metadata(
@@ -1158,6 +1289,8 @@ fn resolve_landlock_wrapper(
         // restriction control off: spawning the in-sandbox proxy bridge
         // before the agent execs.
         && config.network_mode() != crate::config::NetworkMode::Filtered
+        // Port forwards need it for the same reason: their bridges.
+        && config.forward_ports().is_empty()
     {
         return Ok(None);
     }
@@ -1281,9 +1414,20 @@ fn landlock_wrapper_args(
         args.push("--allow-host".into());
         args.push(host.clone());
     }
+    for host in config.allow_private_hosts() {
+        args.push("--allow-private-host".into());
+        args.push(host.clone());
+    }
     if config.network_mode() == crate::config::NetworkMode::Filtered {
         args.push("--proxy-bridge-port".into());
         args.push(crate::proxy::BRIDGE_PORT.to_string());
+    }
+    // Port forwards: the inner config must see them too -- the wrapper
+    // spawns one in-sandbox bridge per port, and lockdown's Landlock V4
+    // net ruleset adds each to its ConnectTcp allow set.
+    for port in config.forward_ports() {
+        args.push("--forward-port".into());
+        args.push(port.to_string());
     }
 
     if config.browser_profile().is_none() {
@@ -1316,13 +1460,12 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
-    let map_args = mounted_map_args(
-        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
-    );
+    let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_binary_path()?;
     let launch = super::build_launch_command(config);
@@ -1358,6 +1501,7 @@ pub fn build(
     }
 
     opt_args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    opt_args.extend(forward_socket_mount_args(config, forward_sockets)?);
 
     opt_args.extend(mount_set.isolation_args(
         project_dir,
@@ -1376,6 +1520,9 @@ pub fn build(
     }
 
     let mut cmd = Command::new(bwrap);
+    // Environment filtering must cover the long-lived bwrap supervisor as
+    // well as its child. All intended child values are encoded in opt_args.
+    cmd.env_clear();
     let args_fd = write_bwrap_args_fd(&opt_args)?;
     cmd.arg("--args").arg(args_fd.to_string());
 
@@ -1575,20 +1722,49 @@ fn persistent_tmp_mount_args_at(
     Ok(args)
 }
 
+/// Port forwards: bind each host-side forward socket into the sandbox
+/// at its fixed per-port path. Same placement and reasoning as the proxy
+/// socket above. Fails closed when a configured port has no socket --
+/// the bridge would otherwise listen on a port that leads nowhere.
+fn forward_socket_mount_args(
+    config: &Config,
+    forward_sockets: &[(u16, PathBuf)],
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for &port in config.forward_ports() {
+        let Some((_, sock)) = forward_sockets.iter().find(|(p, _)| *p == port)
+        else {
+            return Err(format!(
+                "--forward-port {port} requires its host-side Unix socket"
+            ));
+        };
+        args.extend(
+            Mount::Bind {
+                src: sock.clone(),
+                dest: crate::proxy::forward_in_sandbox_path(port),
+            }
+            .to_args(),
+        );
+    }
+    Ok(args)
+}
+
 pub fn dry_run(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<String, String> {
     let sources = MountSources::from_guard(guard);
-    let args = build_dry_run_args_full(
+    let args = build_dry_run_args_forwarded(
         config,
         project_dir,
         &sources,
         verbose,
         proxy_socket,
+        forward_sockets,
     )?;
     Ok(format_dry_run_args(&args))
 }
@@ -1606,6 +1782,7 @@ fn build_dry_run_args(
     build_dry_run_args_full(config, project_dir, &sources, verbose, None)
 }
 
+#[cfg(test)]
 fn build_dry_run_args_full(
     config: &Config,
     project_dir: &Path,
@@ -1613,11 +1790,27 @@ fn build_dry_run_args_full(
     verbose: bool,
     proxy_socket: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    build_dry_run_args_forwarded(
+        config,
+        project_dir,
+        sources,
+        verbose,
+        proxy_socket,
+        &[],
+    )
+}
+
+fn build_dry_run_args_forwarded(
+    config: &Config,
+    project_dir: &Path,
+    sources: &MountSources<'_>,
+    verbose: bool,
+    proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
+) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
-    let map_args = mounted_map_args(
-        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
-    );
+    let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
@@ -1639,6 +1832,7 @@ fn build_dry_run_args_full(
     }
 
     args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    args.extend(forward_socket_mount_args(config, forward_sockets)?);
 
     args.extend(mount_set.isolation_args(
         project_dir,
@@ -1732,13 +1926,11 @@ fn discover_mounts_full(
     let enable_docker = !lockdown && config.docker_enabled();
     let enable_tailscale = !lockdown && config.tailscale_enabled();
     let enable_display = !lockdown && config.display_enabled();
+    let enable_x11 = !lockdown && config.x11_enabled();
     let exempt = super::dotdir_exemptions(config);
 
-    let (display_mounts, display_env) = if enable_display {
-        discover_display(config, verbose)
-    } else {
-        (vec![], vec![])
-    };
+    let (display_mounts, display_env) =
+        discover_display(enable_display, enable_x11, verbose);
     let (audio_mounts, audio_env) = if !lockdown && config.audio_enabled() {
         discover_audio(verbose)
     } else {
@@ -1765,7 +1957,11 @@ fn discover_mounts_full(
     let proxy_env = if config.network_mode()
         == crate::config::NetworkMode::Filtered
     {
-        let mut vars = crate::proxy::env_vars(crate::proxy::BRIDGE_PORT);
+        let mut vars = crate::proxy::env_vars(
+            crate::proxy::BRIDGE_PORT,
+            config.forward_ports(),
+            true,
+        );
         if lockdown {
             for key in config.secret_hosts.keys() {
                 if let Some(value) = config.env_pass.iter().find_map(|entry| {
@@ -1802,20 +1998,15 @@ fn discover_mounts_full(
         lockdown,
         verbose,
     );
-    // Bind destinations (agent state, dotdir passthrough, ...) already
-    // visible inside the sandbox: command-binary exemption paths beneath
-    // them are redundant, and re-binding goes through launcher symlinks
-    // (e.g. codex's current -> releases/<v>) that bwrap refuses to
-    // create mountpoints through.
-    let bound_dests: Vec<std::path::PathBuf> = home_dotfiles
-        .iter()
-        .filter_map(|m| match m {
-            Mount::Bind { dest, .. } | Mount::RoBind { dest, .. } => {
-                Some(dest.clone())
-            }
-            _ => None,
-        })
-        .collect();
+    let (devin_state, devin_state_inside) = split_by_project(
+        discover_devin_state_mounts(
+            config,
+            &home_dotfiles,
+            project_dir,
+            verbose,
+        ),
+        project_dir,
+    );
     // Overlay maps are opt-in and only meaningful when the sandbox
     // can write: disabled under lockdown (read-only) and browser mode.
     let (overlay_mounts_v, overlay_hide_v) = if lockdown || browser_mode {
@@ -1828,6 +2019,18 @@ fn discover_mounts_full(
         (vec![], vec![])
     } else {
         overlay_mounts(&config.overlay_maps, project_dir, verbose)?
+    };
+    // Lockdown clears the environment to paths already supplied by the
+    // sandbox, so it intentionally skips host command exemptions.
+    let command_binary = if !lockdown {
+        discover_command_binary(
+            config,
+            config.private_home_enabled(),
+            &[&home_dotfiles, &devin_state],
+            verbose,
+        )
+    } else {
+        vec![]
     };
     let (extra_outside, extra_inside) = if lockdown || browser_mode {
         (vec![], vec![])
@@ -1859,6 +2062,8 @@ fn discover_mounts_full(
             masks
         },
         home_dotfiles,
+        devin_env: super::devin_child_env(config),
+        devin_state,
         config_hide: if private_home {
             vec![]
         } else {
@@ -1874,18 +2079,7 @@ fn discover_mounts_full(
         } else {
             discover_local_overrides()
         },
-        // Lockdown clears the environment to paths already supplied by the
-        // sandbox, so it intentionally skips host command exemptions.
-        command_binary: if !lockdown {
-            discover_command_binary(
-                config,
-                config.private_home_enabled(),
-                verbose,
-                &bound_dests,
-            )
-        } else {
-            vec![]
-        },
+        command_binary,
         git_worktree: git_worktree_mounts(config, project_dir, verbose),
         gpu: if enable_gpu {
             discover_gpu(verbose)
@@ -1927,6 +2121,7 @@ fn discover_mounts_full(
         extra: extra_outside,
         overlay: overlay_outside,
         project: project_mount(project_dir, lockdown || browser_mode),
+        devin_state_inside,
         extra_inside,
         overlay_inside,
         mask: mask_mounts,
@@ -2173,6 +2368,114 @@ fn discover_home_dotfiles_full(
     mounts
 }
 
+/// Share existing state, pin the launcher ancestor, and protect its versions.
+/// Never create placeholders inside a writable host bind during discovery.
+fn discover_devin_state_mounts(
+    config: &Config,
+    home_mounts: &[Mount],
+    project_dir: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    if crate::command::effective_name(&config.command) != Some("devin")
+        || config.lockdown_enabled()
+        || config.browser_profile().is_some()
+    {
+        return Vec::new();
+    }
+    let Some(installation) = super::devin_installation_dir(config) else {
+        return super::devin_state_paths(config)
+            .into_iter()
+            .filter(|path| safe_state_dir(path))
+            .map(|path| Mount::Bind {
+                src: path.clone(),
+                dest: path,
+            })
+            .collect();
+    };
+    let cli = installation.parent().expect("Devin cli path");
+    let data = cli.parent().expect("Devin data path");
+    let candidates = super::devin_candidate_paths(config);
+    let visible = |path: &Path| {
+        path.starts_with(project_dir)
+            || home_mounts.iter().any(|mount| {
+                matches!(mount, Mount::Bind { .. } | Mount::RoBind { .. })
+                    && path.starts_with(mount.dest())
+            })
+    };
+    let data_selected = candidates.iter().any(|path| path == data);
+    let share_data = config.agent_state_enabled() && data_selected;
+    let protect_visible = data_selected && visible(cli);
+    let installation_kind = super::devin_installation(data);
+    let safe_installation =
+        installation_kind == super::DevinInstallation::Managed;
+    let mut mounts = Vec::new();
+    if data_selected
+        && safe_state_dir(data)
+        && (share_data || visible(data))
+        && installation_kind == super::DevinInstallation::Invalid
+    {
+        output::warn(&format!(
+            "Devin: cli/_versions is missing, unreadable, or a symlink under {}; sharing data read-only",
+            data.display()
+        ));
+        mounts.push(Mount::RoBind {
+            src: data.into(),
+            dest: data.into(),
+        });
+    } else if share_data && safe_state_dir(data) {
+        mounts.push(Mount::Bind {
+            src: data.into(),
+            dest: data.into(),
+        });
+    }
+    if config.agent_state_enabled() {
+        for path in candidates.iter().filter(|path| path.as_path() != data) {
+            if safe_state_dir(path) {
+                mounts.push(Mount::Bind {
+                    src: path.clone(),
+                    dest: path.clone(),
+                });
+            }
+        }
+    }
+    if safe_state_dir(data)
+        && safe_installation
+        && (share_data || protect_visible)
+    {
+        // A mountpoint cannot be renamed. Keep CLI metadata writable when
+        // sharing state, without making an existing read-only home writable.
+        mounts.push(if share_data {
+            Mount::Bind {
+                src: cli.into(),
+                dest: cli.into(),
+            }
+        } else {
+            Mount::RoBind {
+                src: cli.into(),
+                dest: cli.into(),
+            }
+        });
+        mounts.push(Mount::RoBind {
+            src: installation.clone(),
+            dest: installation,
+        });
+    }
+    if verbose {
+        for mount in &mounts {
+            output::verbose(&format!(
+                "Devin: {} {}",
+                mount.dest().display(),
+                if matches!(mount, Mount::Bind { .. }) {
+                    "rw"
+                } else {
+                    "ro"
+                }
+            ));
+        }
+    }
+    mounts
+}
+
 fn command_state_paths(config: &Config) -> &'static [&'static str] {
     match crate::command::effective_name(&config.command) {
         Some("claude") => &[".claude"],
@@ -2193,6 +2496,17 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some("aider") => &[".aider"],
         Some("soulforge") => &[".soulforge"],
         Some("omp") => &[".omp"],
+        // kiro-cli keeps agents, settings and sessions in ~/.kiro and its
+        // login (data.sqlite3) in the XDG data dir. The DOTDIR_RW and
+        // LOCAL_SHARE_RW entries from #73 only apply without private home,
+        // so under the default private home it started logged out.
+        Some("kiro-cli") => &[".kiro", ".local/share/kiro-cli"],
+        // prime-agent keeps auth, sessions, and the Continual
+        // Harness state under ~/.prime/agent (CONFIG_DIR_NAME in
+        // packages/coding-agent/src/config.ts). Deliberately not the
+        // whole ~/.prime: sibling config.json holds the prime CLI's
+        // compute/sandbox API key.
+        Some("prime-agent") => &[".prime/agent"],
         _ => &[],
     }
 }
@@ -2604,8 +2918,8 @@ fn discover_subdir_hide(parent: &str, deny_list: &[&str]) -> Vec<Mount> {
 fn discover_command_binary(
     config: &Config,
     private_home: bool,
+    home_mounts: &[&[Mount]],
     verbose: bool,
-    bound_dests: &[PathBuf],
 ) -> Vec<Mount> {
     let mut paths = if private_home {
         super::command_paths_under(config, &super::home_dir())
@@ -2623,26 +2937,108 @@ fn discover_command_binary(
     // dangling symlink until its versions dir is mounted (#138).
     let all = paths.clone();
     paths.retain(|p| !all.iter().any(|a| a != p && p.starts_with(a)));
-    // A path beneath an already-bound destination (agent state, dotdir
-    // passthrough) is visible in the sandbox already; re-binding it
-    // would chase launcher symlinks (codex's current -> releases/<v>)
-    // that bwrap cannot create mountpoints through.
-    paths.retain(|p| !bound_dests.iter().any(|a| p.starts_with(a)));
-    paths
-        .into_iter()
-        .map(|path| {
+    // FORK: mounted agent state and dotdirs already expose command paths;
+    // rebinding under them can make bwrap follow Codex's current symlink
+    // through a mountpoint that does not exist in the sandbox.
+    let bound_dests: Vec<PathBuf> = home_mounts
+        .iter()
+        .flat_map(|mounts| mounts.iter())
+        .filter_map(|mount| match mount {
+            Mount::Bind { dest, .. } | Mount::RoBind { dest, .. } => {
+                Some(dest.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    paths.retain(|p| !bound_dests.iter().any(|dest| p.starts_with(dest)));
+    // END FORK
+    // Process each path in the symlink chain. Paths collected by
+    // command_paths_under_impl come in order: symlink hops within root,
+    // then the terminal directory's parent. Symlinks must preserve their
+    // target text so bun's app-root heuristic (dirname of invoked exe)
+    // can find package.json in adjacent directories.
+    let mut mounts = Vec::new();
+    for mut path in paths {
+        // Check if this path is a symlink on the host.
+        let is_symlink = path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        // A path an earlier home mount exposes as the host's own directory
+        // is already visible, symlinks included. Binding over it again can
+        // fail: the codex standalone installer's `~/.codex/.../current` is
+        // an absolute symlink, and bwrap cannot create a mount point
+        // through it. Only a terminal directory whose real path leaves
+        // that mount still needs a bind, made at the real path.
+        if exposed_by_self_bind(home_mounts, &path) {
+            match path.canonicalize() {
+                Ok(real)
+                    if !is_symlink
+                        && !exposed_by_self_bind(home_mounts, &real) =>
+                {
+                    path = real;
+                }
+                _ => continue,
+            }
+        }
+        if is_symlink {
+            // Read the symlink target text verbatim. The target may be
+            // relative (e.g., "../share/prime-agent/bin/prime-agent")
+            // or absolute (/home/user/.local/share/prime-agent/bin/prime-agent).
+            // Both work inside the sandbox because the HOME tmpfs is mounted at
+            // the same destination.
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    if verbose {
+                        output::verbose(&format!(
+                            "Command binary: {} -> {} (symlink)",
+                            path.display(),
+                            target.display()
+                        ));
+                    }
+                    mounts.push(Mount::Symlink {
+                        src: target.to_string_lossy().into_owned(),
+                        dest: path,
+                    });
+                }
+                Err(e) => {
+                    output::warn(&format!(
+                        "Command binary: cannot read symlink {}: {e}; \
+                         skipping.",
+                        path.display()
+                    ));
+                }
+            }
+        } else {
+            // Terminal directory: emit as read-only bind mount.
             if verbose {
                 output::verbose(&format!(
                     "Command binary: {} ro",
                     path.display()
                 ));
             }
-            Mount::RoBind {
+            mounts.push(Mount::RoBind {
                 src: path.clone(),
                 dest: path,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    mounts
+}
+
+/// Whether the most specific of `mounts` covering `path` binds the host
+/// directory onto itself, so `path` already appears as on the host.
+fn exposed_by_self_bind(mounts: &[&[Mount]], path: &Path) -> bool {
+    let covering = mounts
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|m| path.starts_with(m.dest()))
+        .max_by_key(|m| m.dest().components().count());
+    matches!(
+        covering,
+        Some(Mount::Bind { src, dest } | Mount::RoBind { src, dest })
+            if src == dest
+    )
 }
 
 fn command_mount_path(path: &Path) -> PathBuf {
@@ -2841,30 +3237,29 @@ fn discover_shm(host_shared: bool) -> Vec<Mount> {
     }
 }
 
+/// Display passthrough. Wayland (`--display`) and X11 (`--x11`) are
+/// separate opt-ins: either can be enabled without the other.
 fn discover_display(
-    config: &Config,
+    display: bool,
+    x11: bool,
     verbose: bool,
 ) -> (Vec<Mount>, Vec<(String, String)>) {
     let mut mounts = Vec::new();
     let mut env = Vec::new();
 
-    let x11 = PathBuf::from("/tmp/.X11-unix");
-    if config.x11_enabled() && x11.is_dir() {
+    let x11_dir = PathBuf::from("/tmp/.X11-unix");
+    if x11 && x11_dir.is_dir() {
         mounts.push(Mount::Bind {
-            src: x11.clone(),
-            dest: x11,
+            src: x11_dir.clone(),
+            dest: x11_dir,
         });
     }
 
-    if config.x11_enabled()
-        && let Ok(display) = std::env::var("DISPLAY")
-    {
+    if x11 && let Ok(display) = std::env::var("DISPLAY") {
         env.push(("DISPLAY".into(), display));
     }
 
-    if config.x11_enabled()
-        && let Ok(xauth) = std::env::var("XAUTHORITY")
-    {
+    if x11 && let Ok(xauth) = std::env::var("XAUTHORITY") {
         let xauth_path = PathBuf::from(&xauth);
         if safe_xauthority(&xauth_path) {
             mounts.push(Mount::RoBind {
@@ -2879,10 +3274,12 @@ fn discover_display(
         }
     }
 
-    if let (Ok(xdg_dir), Ok(wayland)) = (
-        std::env::var("XDG_RUNTIME_DIR"),
-        std::env::var("WAYLAND_DISPLAY"),
-    ) {
+    if display
+        && let (Ok(xdg_dir), Ok(wayland)) = (
+            std::env::var("XDG_RUNTIME_DIR"),
+            std::env::var("WAYLAND_DISPLAY"),
+        )
+    {
         let xdg_path = PathBuf::from(&xdg_dir);
         if is_safe_xdg_runtime(&xdg_path) {
             if let Ok(runtime) = xdg_path.canonicalize()
@@ -3847,13 +4244,13 @@ mod tests {
                         && w[1] == empty_str
                         && w[2] == masked_str
                 }),
-                "expected glob-expanded mask for {}; args: {args:?}",
+                "expected glob-expanded mask for {}",
                 masked.display()
             );
         }
         assert!(
             !args.iter().any(|arg| arg.ends_with("public.txt")),
-            "non-matching files must not be masked; args: {args:?}"
+            "non-matching files must not be masked"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4005,6 +4402,72 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == &private.display().to_string()));
 
         let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    fn x11_dry_run_args(config: &Config) -> Vec<String> {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let sources = MountSources::from_guard(&guard);
+        build_dry_run_args_full(
+            config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn sets_env(args: &[String], name: &str, value: &str) -> bool {
+        args.windows(3)
+            .any(|w| w[0] == "--setenv" && w[1] == name && w[2] == value)
+    }
+
+    #[test]
+    fn x11_is_passed_through_without_display() {
+        // `--x11` is its own capability: X11-only apps and browsers use it
+        // instead of `--display` (README "Browsers").
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let _wayland = EnvVarGuard::remove("WAYLAND_DISPLAY");
+        let config = Config {
+            no_display: Some(true),
+            x11: Some(true),
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(sets_env(&args, "DISPLAY", ":42"));
+    }
+
+    #[test]
+    fn display_without_x11_passes_no_x11() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let config = Config {
+            no_display: Some(false),
+            x11: None,
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"));
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"));
+    }
+
+    #[test]
+    fn x11_stays_off_under_lockdown() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let config = Config {
+            lockdown: Some(true),
+            x11: Some(true),
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"));
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"));
     }
 
     #[test]
@@ -4314,6 +4777,7 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let config = Config {
             allow_hosts: vec!["api.anthropic.com".into()],
+            allow_private_hosts: vec!["git.internal.example".into()],
             ..minimal_test_config()
         };
         let sources = MountSources::from_guard(&guard);
@@ -4359,8 +4823,14 @@ mod tests {
             .position(|w| w[0] == "--allow-host")
             .expect("expected --allow-host in wrapper args");
         assert_eq!(args[host_pos + 1], "api.anthropic.com");
+        let private_host_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--allow-private-host")
+            .expect("expected --allow-private-host in wrapper args");
+        assert_eq!(args[private_host_pos + 1], "git.internal.example");
         // The forced proxy env names the in-sandbox bridge port, and
-        // no_proxy is emptied.
+        // Linux loopback belongs to the private network namespace, so local
+        // client/server traffic bypasses the proxy without reaching the host.
         let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);
         assert!(args.windows(3).any(|w| {
             w[0] == "--setenv" && w[1] == "http_proxy" && w[2] == url
@@ -4369,7 +4839,9 @@ mod tests {
             w[0] == "--setenv" && w[1] == "HTTPS_PROXY" && w[2] == url
         }));
         assert!(args.windows(3).any(|w| {
-            w[0] == "--setenv" && w[1] == "no_proxy" && w[2].is_empty()
+            w[0] == "--setenv"
+                && w[1] == "no_proxy"
+                && w[2] == "127.0.0.1,localhost,::1"
         }));
         // The outer proxy's own TCP port never appears.
         assert!(
@@ -4397,6 +4869,113 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn forward_port_dry_run_mounts_socket_and_forces_wrapper() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            forward_ports: vec![49374],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let sock = PathBuf::from("/tmp/ai-jail-forward-test.49374.sock");
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &[(49374, sock.clone())],
+        )
+        .unwrap();
+
+        // No network flag: the private netns stays and the forward
+        // crosses it through the socket only.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("expected /tmp tmpfs mount");
+        let dest = crate::proxy::forward_in_sandbox_path(49374)
+            .display()
+            .to_string();
+        let socket_mount = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind"
+                    && w[1] == sock.display().to_string()
+                    && w[2] == dest
+            })
+            .expect("expected forward socket bind mount");
+        assert!(socket_mount > tmpfs_tmp);
+        // The wrapper is forced (it spawns the bridge) and sees the port.
+        assert!(args.iter().any(|arg| arg == "--landlock-exec"));
+        let pos = args
+            .iter()
+            .position(|arg| arg == "--forward-port")
+            .expect("expected --forward-port in wrapper args");
+        assert_eq!(args[pos + 1], "49374");
+        // Forwarding is not filtered egress: no proxy env, no bridge port.
+        assert!(!args.iter().any(|arg| arg == "--proxy-bridge-port"));
+        assert!(!args.iter().any(|arg| arg == "http_proxy"));
+    }
+
+    #[test]
+    fn forward_port_under_filtered_egress_exempts_loopback_from_proxy() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            Some(Path::new("/tmp/ai-jail-proxy-test.sock")),
+            &[(49374, PathBuf::from("/tmp/ai-jail-forward-test.49374.sock"))],
+        )
+        .unwrap();
+
+        for key in ["no_proxy", "NO_PROXY"] {
+            assert!(
+                args.windows(3).any(|w| {
+                    w[0] == "--setenv"
+                        && w[1] == key
+                        && w[2] == "127.0.0.1,localhost,::1"
+                }),
+                "{key}"
+            );
+        }
+        let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "http_proxy" && w[2] == url
+        }));
+    }
+
+    #[test]
+    fn forward_port_without_its_socket_fails_closed() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            forward_ports: vec![49374, 8080],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let result = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &[(49374, PathBuf::from("/tmp/only-one.sock"))],
+        );
+        assert!(result.unwrap_err().contains("--forward-port 8080"));
     }
 
     #[test]
@@ -4500,7 +5079,7 @@ mod tests {
         });
         assert!(
             found,
-            "default behavior must auto-mask .ai-jail with the empty tempfile; args: {args:?}"
+            "default behavior must auto-mask .ai-jail with the empty tempfile"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4537,7 +5116,7 @@ mod tests {
         });
         assert!(
             !found,
-            "no_hide_config=true must skip the auto-mask of .ai-jail; args: {args:?}"
+            "no_hide_config=true must skip the auto-mask of .ai-jail"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4659,7 +5238,7 @@ mod tests {
         assert_eq!(
             occurrences, 1,
             "Exactly one --ro-bind for .ai-jail expected, got {occurrences}.\n\
-             Auto-mask dedup is broken — full args: {args:?}"
+             Auto-mask dedup is broken"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -5097,6 +5676,13 @@ mod tests {
             .any(|w| w[0] == "--ro-bind" && w[1] == p && w[2] == p)
     }
 
+    fn has_symlink(args: &[String], src: &Path, dest: &Path) -> bool {
+        let src = src.display().to_string();
+        let dest = dest.display().to_string();
+        args.windows(3)
+            .any(|w| w[0] == "--symlink" && w[1] == src && w[2] == dest)
+    }
+
     fn prepend_path(dir: &Path) -> std::ffi::OsString {
         std::env::var_os("PATH").map_or_else(
             || dir.as_os_str().to_os_string(),
@@ -5135,10 +5721,86 @@ mod tests {
         )
         .unwrap();
 
-        assert!(has_ro_bind(&args, &home.join(".local/bin/agent")));
+        assert!(has_symlink(
+            &args,
+            &home.join(".local/share/agent/versions/1.0"),
+            &home.join(".local/bin/agent")
+        ));
         assert!(has_ro_bind(
             &args,
             &home.join(".local/share/agent/versions")
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_binary_skips_paths_exposed_by_home_bind() {
+        // codex standalone installer: `~/.codex` is already bound, and its
+        // `current` symlink is absolute. A ro-bind through it made bwrap
+        // abort with "Can't mkdir .../current/bin".
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-cmd-home-dirlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let codex_dir = home.join(".codex");
+        let standalone = codex_dir.join("packages/standalone");
+        let release_bin = standalone.join("releases/0.1/bin");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&release_bin).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = release_bin.join("codex");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let current = standalone.join("current");
+        std::os::unix::fs::symlink(standalone.join("releases/0.1"), &current)
+            .unwrap();
+        let launcher = bin.join("codex");
+        std::os::unix::fs::symlink(current.join("bin/codex"), &launcher)
+            .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", prepend_path(&bin));
+        let config = Config {
+            command: vec!["codex".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let home_mounts = vec![
+            Mount::Tmpfs { dest: home.clone() },
+            Mount::Bind {
+                src: codex_dir.clone(),
+                dest: codex_dir.clone(),
+            },
+        ];
+
+        let mounts =
+            discover_command_binary(&config, true, &[&home_mounts, &[]], false);
+
+        let dests: Vec<&Path> = mounts.iter().map(Mount::dest).collect();
+        assert_eq!(dests, vec![launcher.as_path()]);
+
+        // When `current` leaves the bound directory, the release is bound
+        // at its real path, which the exposed symlink then resolves to.
+        let outside = home.join("opt/codex-0.1");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::rename(release_bin.parent().unwrap(), &outside).unwrap();
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(&outside, &current).unwrap();
+        let mounts =
+            discover_command_binary(&config, true, &[&home_mounts, &[]], false);
+        let real_bin = outside.join("bin");
+        let dests: Vec<&Path> = mounts.iter().map(Mount::dest).collect();
+        assert_eq!(dests, vec![launcher.as_path(), real_bin.as_path()]);
+        assert!(matches!(
+            &mounts[1],
+            Mount::RoBind { src, .. } if *src == real_bin
         ));
 
         let _ = std::fs::remove_dir_all(&home);
@@ -5198,14 +5860,82 @@ mod tests {
     }
 
     #[test]
+    fn private_home_preserves_command_symlink_chain() {
+        // Regression (prime-agent): --ro-bind flattened the symlink hops,
+        // so bun's app-root heuristic (dirname of the invoked exe) resolved
+        // next to the launcher and crashed with ENOENT package.json.
+        // The chain launcher -> mid -> release must keep its symlinks, with
+        // only the terminal release dir as a read-only bind.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-cmd-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let release = home.join(".local/share/prime-agent/releases/0.9.8");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/prime-agent/bin"))
+            .unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(release.join("prime-agent"), "#!/bin/sh\n").unwrap();
+        std::fs::write(release.join("package.json"), "{}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            release.join("prime-agent"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../share/prime-agent/bin/prime-agent",
+            home.join(".local/bin/prime-agent"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../releases/0.9.8/prime-agent",
+            home.join(".local/share/prime-agent/bin/prime-agent"),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", prepend_path(&home.join(".local/bin")));
+
+        let config = Config {
+            command: vec!["prime-agent".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        // Both hops keep their relative target text verbatim.
+        assert!(has_symlink(
+            &args,
+            Path::new("../share/prime-agent/bin/prime-agent"),
+            &home.join(".local/bin/prime-agent")
+        ));
+        assert!(has_symlink(
+            &args,
+            Path::new("../releases/0.9.8/prime-agent"),
+            &home.join(".local/share/prime-agent/bin/prime-agent")
+        ));
+        // Only the terminal release dir is a read-only bind.
+        assert!(has_ro_bind(&args, &release));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn command_binary_skips_paths_under_agent_state_bind() {
-        // Regression (fork): codex lives at ~/.local/bin/codex ->
-        // ~/.codex/packages/standalone/current/bin/codex, where `current`
-        // is a symlink. agent_state binds all of ~/.codex read-write, so
-        // the exemption re-bind of the real binary dir is redundant —
-        // and bwrap refuses to create mountpoints through the `current`
-        // symlink ("Can't mkdir ... current/bin: No such file or
-        // directory"), killing the launch.
+        // Codex's standalone launcher resolves through ~/.codex, which is
+        // already writable agent state. Rebinding its target through the
+        // current symlink makes bwrap fail to create the mountpoint.
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "ai-jail-bwrap-cmd-agent-state-{}",
@@ -5251,14 +5981,11 @@ mod tests {
         )
         .unwrap();
 
-        // The agent-state bind covers the real binary dir...
         let codex_dir = home.join(".codex").display().to_string();
         assert!(
             args.windows(3)
-                .any(|w| w[0] == "--bind" && w[1] == codex_dir)
+                .any(|w| { w[0] == "--bind" && w[1] == codex_dir })
         );
-        // ...so the through-symlink re-bind must be gone, while the
-        // PATH-name ro-bind stays.
         assert!(
             !args.contains(
                 &standalone.join("current/bin").display().to_string()
@@ -6168,7 +6895,7 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let cmd = build(&guard, &config, &project, false, None).unwrap();
+        let cmd = build(&guard, &config, &project, false, None, &[]).unwrap();
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -6460,6 +7187,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn kiro_cli_state_is_mounted_under_private_home() {
+        // Regression: #73 put .kiro in DOTDIR_RW and kiro-cli in
+        // LOCAL_SHARE_RW, but both only apply without private home, so
+        // once private home became the default `ai-jail kiro-cli` started
+        // logged out (its login is ~/.local/share/kiro-cli/data.sqlite3).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-kiro-state-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let kiro_dir = home.join(".kiro");
+        let kiro_data = home.join(".local/share/kiro-cli");
+        std::fs::create_dir_all(kiro_dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(&kiro_data).unwrap();
+        let mounted = |mounts: &[Mount], path: &Path| {
+            mounts.iter().any(|m| {
+                matches!(m, Mount::Bind { src, dest } if src == path && dest == path)
+            })
+        };
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mut kiro = minimal_test_config();
+        kiro.command = vec!["kiro-cli".into()];
+        kiro.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&kiro, true, &[], false, false);
+        assert!(
+            mounted(&mounts, &kiro_dir),
+            "~/.kiro must be mounted read-write under private home"
+        );
+        assert!(
+            mounted(&mounts, &kiro_data),
+            "kiro-cli's login lives in ~/.local/share/kiro-cli; without it the agent starts logged out"
+        );
+
+        // With agent state off (--no-agent-state), or for another agent,
+        // both stay hidden.
+        let mut gated = minimal_test_config();
+        gated.command = vec!["kiro-cli".into()];
+        gated.agent_state = Some(false);
+        let mounts =
+            discover_home_dotfiles_full(&gated, true, &[], false, false);
+        assert!(!mounted(&mounts, &kiro_dir) && !mounted(&mounts, &kiro_data));
+
+        let mut other = minimal_test_config();
+        other.command = vec!["claude".into()];
+        other.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&other, true, &[], false, false);
+        assert!(!mounted(&mounts, &kiro_dir) && !mounted(&mounts, &kiro_data));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // ── Agent-state capability gating ───────────────────────────
 
     #[test]
@@ -6618,6 +7399,10 @@ mod tests {
             ("aider", &[".aider"]),
             ("soulforge", &[".soulforge"]),
             ("omp", &[".omp"]),
+            ("kiro-cli", &[".kiro", ".local/share/kiro-cli"]),
+            // Only .prime/agent, never the whole ~/.prime: sibling
+            // config.json holds the prime CLI's API key.
+            ("prime-agent", &[".prime/agent"]),
         ];
         for (command, expected) in cases {
             let mut config = minimal_test_config();
@@ -6628,6 +7413,319 @@ mod tests {
                 "state mapping mismatch for {command}"
             );
         }
+    }
+
+    #[test]
+    fn devin_state_mounts_rw_and_installation_ro_are_forwarded() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-devin-state-mounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let data_state = data_home.join("devin");
+        let config_state = config_home.join("devin");
+        let installation = data_state.join("cli/_versions");
+        std::fs::create_dir_all(installation.join("3000.11.3")).unwrap();
+        std::fs::create_dir_all(&config_state).unwrap();
+        std::os::unix::fs::symlink("3000.11.3", installation.join("current"))
+            .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &[],
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 4);
+        assert!(matches!(
+            &mounts[0],
+            Mount::Bind { src, dest }
+                if src == &data_state && dest == &data_state
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == &config_state && dest == &config_state
+        ));
+        assert!(matches!(
+            &mounts[3],
+            Mount::RoBind { src, dest }
+                if src == &installation && dest == &installation
+        ));
+
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let guard = SandboxGuard::test_with_hosts(root.join("hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let data_rw = data_state.display().to_string();
+        let install_ro = installation.display().to_string();
+        let rw_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == data_rw && w[2] == data_rw
+            })
+            .expect("Devin data root should be mounted read-write");
+        let ro_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind" && w[1] == install_ro && w[2] == install_ro
+            })
+            .expect("Devin installation should be remounted read-only");
+        assert!(rw_index < ro_index, "installation RO bind must win");
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "--landlock-rw-path" && w[1] == data_rw })
+        );
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "--landlock-ro-path" && w[1] == install_ro
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn devin_state_mounts_respect_opt_out_lockdown_and_browser_mode() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-devin-state-gates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let state = data_home.join("devin");
+        std::fs::create_dir_all(state.join("cli/_versions")).unwrap();
+        std::fs::create_dir_all(config_home.join("devin")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+
+        assert!(
+            !discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.agent_state = Some(false);
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.private_home = Some(false);
+        // An external XDG root is not exposed merely to protect it.
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        // Already-visible home state remains protected without RW grants.
+        let home_mounts = vec![Mount::RoBind {
+            src: data_home.clone(),
+            dest: data_home.clone(),
+        }];
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &home_mounts,
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| matches!(mount, Mount::RoBind { .. }))
+        );
+        config.private_home = None;
+        config.agent_state = None;
+        config.lockdown = Some(true);
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.lockdown = None;
+        config.browser_profile = Some("soft".into());
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        config.browser_profile = None;
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        assert!(!state.exists(), "missing state must not be created");
+        assert!(
+            !config_home.join("devin").exists(),
+            "missing config must not be created"
+        );
+    }
+
+    #[test]
+    fn devin_state_skips_writable_data_root_when_versions_is_symlink() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-devin-versions-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let data_state = data_home.join("devin");
+        let config_state = config_home.join("devin");
+        let cli = data_state.join("cli");
+        let installation = cli.join("_versions");
+        let external_versions = root.join("versions");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::create_dir_all(&config_state).unwrap();
+        std::fs::create_dir_all(external_versions.join("3000.11.3")).unwrap();
+        std::os::unix::fs::symlink(&external_versions, &installation).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+        config.private_home = Some(false);
+
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &[],
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == &config_state && dest == &config_state
+        ));
+        assert!(!mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::Bind { src, .. } if src == &data_state
+        )));
+        assert!(!mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::RoBind { src, .. } if src == &installation
+        )));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn devin_state_inside_project_stays_after_project_and_before_masks() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-devin-project-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let project = root.join("project");
+        let data_home = project.join("xdg-data");
+        let data_state = data_home.join("devin");
+        let installation = data_state.join("cli/_versions");
+        std::fs::create_dir_all(installation.join("3000.11.3")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let missing_config = root.join("missing-config");
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", missing_config.as_os_str());
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+        config.mask = vec![data_state.clone()];
+
+        let guard = SandboxGuard::test_with_hosts(root.join("hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let project_text = project.display().to_string();
+        let state_text = data_state.display().to_string();
+        let installation_text = installation.display().to_string();
+        let project_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == project_text && w[2] == project_text
+            })
+            .expect("project should be bound");
+        let state_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == state_text && w[2] == state_text
+            })
+            .expect("Devin state should be rebound after project");
+        let installation_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind"
+                    && w[1] == installation_text
+                    && w[2] == installation_text
+            })
+            .expect("installation should remain read-only");
+        let mask_index = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == state_text)
+            .expect("mask should still cover the Devin state path");
+        assert!(project_index < state_index);
+        assert!(state_index < installation_index);
+        assert!(installation_index < mask_index);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Sandbox environment filtering ───────────────────────────
@@ -6786,6 +7884,44 @@ mod tests {
             args.windows(3)
                 .any(|w| w[0] == "--setenv" && w[1] == "PATH")
         );
+    }
+
+    #[test]
+    fn env_args_sets_login_name_from_passwd_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _user = EnvVarGuard::set("USER", "not-the-passwd-name");
+        let _logname = EnvVarGuard::remove("LOGNAME");
+        let name = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .name;
+
+        let args = env_args(false, &[]);
+        assert!(sets_env(&args, "USER", &name));
+        assert!(sets_env(&args, "LOGNAME", &name));
+        assert!(!sets_env(&args, "USER", "not-the-passwd-name"));
+    }
+
+    #[test]
+    fn env_args_login_name_yields_to_env_pass_and_inherit() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let args = env_args(false, &["USER=chosen".to_string()]);
+        let users: Vec<&String> = args
+            .windows(3)
+            .filter(|w| w[0] == "--setenv" && w[1] == "USER")
+            .map(|w| &w[2])
+            .collect();
+        assert_eq!(users, ["chosen"]);
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "LOGNAME")
+        );
+
+        // --inherit-env recreates the host's own values explicitly because
+        // the outer bwrap process is launched with an empty environment.
+        let _user = EnvVarGuard::set("USER", "host-user");
+        let args = env_args(true, &[]);
+        assert!(sets_env(&args, "USER", "host-user"));
     }
 
     #[test]
@@ -7011,11 +8147,9 @@ mod tests {
         assert!(!nix_store_metadata_is_protected(0, 0o1777));
         assert!(!nix_store_metadata_is_protected(65534, 0o1777));
         assert!(!nix_store_metadata_is_protected(65534, 0o777));
-        // Read-only store owned by someone else is still fine.
-        assert!(nix_store_metadata_is_protected(1000, 0o555));
-        // Single-user store the invoking user can write: the
-        // non-root-owned relaxation must not apply, or anyone running
-        // as that user could drop in a fake bwrap.
+        // Non-root ownership is refused even when the current mode is
+        // read-only: the owner can chmod it and replace a trusted binary.
+        assert!(!nix_store_metadata_is_protected(1000, 0o555));
         assert!(!nix_store_metadata_is_protected(1000, 0o755));
         assert!(!nix_store_metadata_is_protected(1000, 0o775));
     }
@@ -7458,6 +8592,72 @@ nameserver 8.8.8.8
     }
 
     #[test]
+    fn missing_bwrap_still_says_install_it() {
+        let msg = bwrap_lookup_error(&[], None);
+        assert!(msg.starts_with("bwrap (bubblewrap) not found"), "{msg}");
+        assert!(msg.contains("Install it"), "{msg}");
+    }
+
+    #[test]
+    fn untrusted_binary_reason_names_the_failed_rule() {
+        assert_eq!(
+            untrusted_binary_reason(false, 0, 0o755, false, Some(65534)),
+            "not a regular file"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 0, 0o644, false, Some(65534)),
+            "not executable (mode 0644)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 0, 0o775, false, Some(65534)),
+            "writable by group or others (mode 0775)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 1000, 0o755, true, Some(65534)),
+            "writable by group or others (mode 0755)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 1000, 0o755, false, Some(65534)),
+            "owned by uid 1000, not root"
+        );
+        let overflow =
+            untrusted_binary_reason(true, 65534, 0o755, false, Some(65534));
+        assert!(overflow.starts_with("owned by uid 65534 (the overflow uid)"));
+        assert!(overflow.contains("user namespace"));
+    }
+
+    #[test]
+    fn rejected_bwrap_is_reported_as_found() {
+        let tmp = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-found.{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let bwrap = tmp.join("bwrap");
+        std::fs::write(&bwrap, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &bwrap,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut rejected = Vec::new();
+        assert!(trusted_bwrap_candidate(&bwrap, &mut rejected).is_none());
+        // Seen twice (BWRAP_BIN and PATH), listed once.
+        assert!(trusted_bwrap_candidate(&bwrap, &mut rejected).is_none());
+        assert_eq!(rejected.len(), 1);
+        let line = &rejected[0].1;
+        assert!(
+            line.starts_with(&format!("{}: owned by uid", bwrap.display()))
+        );
+
+        let msg = bwrap_lookup_error(&rejected, None);
+        assert!(msg.contains("was found but failed"), "{msg}");
+        assert!(!msg.contains("Install it"), "{msg}");
+        assert!(msg.contains(line.as_str()), "{msg}");
+        let _ = std::fs::remove_file(&bwrap);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
     fn bwrap_bin_env_override_invalid_path_is_not_selected() {
         let _env = ENV_LOCK.lock().unwrap();
         let _bwrap_bin =
@@ -7502,7 +8702,7 @@ nameserver 8.8.8.8
         });
         assert!(
             bind_pos.is_some(),
-            "--bind for claude_dir not found in argv: {args:?}"
+            "--bind for claude_dir not found in argv"
         );
 
         let setenv_pos = args.windows(3).position(|w| {
@@ -7512,8 +8712,7 @@ nameserver 8.8.8.8
         });
         assert!(
             setenv_pos.is_some(),
-            "--setenv CLAUDE_CONFIG_DIR not found in argv: \
-             {args:?}"
+            "--setenv CLAUDE_CONFIG_DIR not found in argv"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);

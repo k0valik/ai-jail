@@ -10,7 +10,7 @@ USAGE:
 
 COMMANDS (positional):
     gemini, claude, codex, opencode, crush, soulforge, grok, pi, jcode,
-    kimi, bash
+    kimi, kiro-cli, devin, bash
                                             Known AI tool presets
     status                                 Show current .ai-jail config
     Any other string                       Passed through as the command
@@ -46,9 +46,9 @@ OPTIONS:
     --audio / --no-audio           Enable/disable host audio passthrough
                                    (PulseAudio/PipeWire sockets + /dev/snd;
                                    Linux only; default: off)
-    --github / --no-github         Enable/disable read-only ~/.config/gh mount
-                                   (read-only; opt-in; the agent can use these
-                                   credentials; default: off)
+    --github / --no-github         Share gh config read-only and the active
+                                   github.com token from host gh (including
+                                   keyring storage); default: off
     --aws / --no-aws               Enable/disable read-only ~/.aws mount
                                    (read-only; opt-in; the agent can use these
                                    credentials; default: off)
@@ -80,11 +80,11 @@ OPTIONS:
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; not persisted to .ai-jail).
-                                    NOTE: the value is placed on the sandbox
-                                    launcher's argv, so another process of the
-                                    same user can read it via /proc/<pid>/cmdline
-                                    (#147). For a real secret prefer --secret
-                                    (value kept off argv), not --env.
+                                    A literal NAME=VALUE is visible on ai-jail's
+                                    own argv before launch. Use --env NAME or
+                                    --env-from-file to avoid that exposure;
+                                    --secret keeps a bound HTTP value outside
+                                    the sandbox entirely.
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)
@@ -130,6 +130,12 @@ OPTIONS:
     --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
                                    built-in filtered proxy (repeatable; implies filtered
                                    network mode; cannot combine with --network)
+    --allow-private-host <HOST>    Like --allow-host, and also permit HOST and its subdomains
+                                   to resolve to private/CGNAT addresses (repeatable; trusted
+                                   config/CLI only; loopback, link-local, and metadata stay denied)
+    --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
+                                   loopback (repeatable; cannot combine with --network;
+                                   the service behind PORT is reachable in full)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -185,6 +191,8 @@ pub struct CliArgs {
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
     pub allow_hosts: Vec<String>,
+    pub allow_private_hosts: Vec<String>,
+    pub forward_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
@@ -373,6 +381,24 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--allow-host requires a non-empty host".into());
                 }
                 args.allow_hosts.push(host.into_owned());
+            }
+            Long("allow-private-host") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let host = val.to_string_lossy();
+                if host.is_empty() {
+                    return Err(
+                        "--allow-private-host requires a non-empty host".into(),
+                    );
+                }
+                args.allow_private_hosts.push(host.into_owned());
+            }
+            Long("forward-port") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text
+                    .parse()
+                    .map_err(|_| format!("invalid port number: {port_text}"))?;
+                args.forward_ports.push(port);
             }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -719,6 +745,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--hide-dotdir",
     "--allow-tcp-port",
     "--allow-host",
+    "--allow-private-host",
     "--systemd-user",
     "--no-systemd-user",
     "--worktree",
@@ -734,6 +761,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-terminal-passthrough",
     "--agent-state",
     "--no-agent-state",
+    "--forward-port",
     "--inherit-env",
     "--no-inherit-env",
     "--update-check",
@@ -1752,6 +1780,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_forward_port_repeatable() {
+        let args = parse_test(&[
+            "--forward-port",
+            "49374",
+            "--forward-port",
+            "64342",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.forward_ports, vec![49374, 64342]);
+        assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn forward_port_after_the_command_is_refused() {
+        // It would otherwise reach the child as its own argument.
+        assert!(parse_test(&["bash", "--forward-port", "49374"]).is_err());
+        // After `--` it belongs to the child, as for every sandbox flag.
+        assert!(parse_test(&["bash", "--", "--forward-port", "49374"]).is_ok());
+    }
+
+    #[test]
+    fn parse_forward_port_invalid() {
+        assert!(parse_test(&["--forward-port", "70000", "bash"]).is_err());
+        assert!(parse_test(&["--forward-port", "http", "bash"]).is_err());
+        assert!(parse_test(&["--forward-port"]).is_err());
+    }
+
+    #[test]
     fn parse_allow_tcp_port_single() {
         let args =
             parse_test(&["--lockdown", "--allow-tcp-port", "32000", "bash"])
@@ -1833,6 +1890,30 @@ mod tests {
         let error =
             parse_test(&["claude", "--allow-host=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_allow_private_host_repeatable_and_guarded() {
+        let args = parse_test(&[
+            "--allow-private-host",
+            "gitlab.example.com",
+            "--allow-private-host=registry.example.com",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.allow_private_hosts,
+            vec![
+                "gitlab.example.com".to_string(),
+                "registry.example.com".to_string()
+            ]
+        );
+        assert!(parse_test(&["--allow-private-host"]).is_err());
+        assert!(
+            parse_test(&["bash", "--allow-private-host=gitlab.example.com"])
+                .unwrap_err()
+                .contains("after command")
+        );
     }
 
     #[test]

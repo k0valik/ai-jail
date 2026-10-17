@@ -17,125 +17,12 @@
 // main.rs's proxy construction; it is never documented.
 #![cfg(target_os = "linux")]
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// Serialize launches: the orphan scan must not see another test's
-// bridge, and parallel bwrap runs against one project dir race.
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-/// bwrap needs unprivileged user namespaces, and filtered egress adds a
-/// network namespace on top; detect restrictions at runtime and skip.
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--unshare-net",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// The fixture requests need a host curl binary to drive HTTP traffic
-/// through the proxy bridge; detect availability and skip when absent.
-fn curl_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("curl")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-macro_rules! require_curl {
-    () => {
-        if !curl_available() {
-            eprintln!("SKIPPED: curl not found in PATH");
-            return;
-        }
-    };
-}
-
-/// Lockdown mode clears the environment and sets PATH to standard FHS
-/// directories (/usr/bin, /bin); on non-FHS systems (NixOS, etc.) guest
-/// binaries like bash or curl are not present in those locations.
-fn lockdown_cmd_available(cmd: &str) -> bool {
-    const LOCKDOWN_PATH: &str =
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    LOCKDOWN_PATH
-        .split(':')
-        .any(|dir| std::path::Path::new(dir).join(cmd).is_file())
-}
-
-macro_rules! require_lockdown_tools {
-    ($($cmd:expr),+ $(,)?) => {
-        $(
-            if !lockdown_cmd_available($cmd) {
-                eprintln!(
-                    "SKIPPED: {} not found in lockdown PATH \
-                     (non-FHS system / NixOS)",
-                    $cmd
-                );
-                return;
-            }
-        )+
-    };
-}
-
-macro_rules! require_bwrap_net {
-    () => {
-        if !bwrap_net_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create network namespaces \
-                 on this system (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
-
-/// Minimal HTTP fixture on host loopback: one request in, a fixed
-/// `ok` body out. Runs forever on its own thread.
-fn http_fixture() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for conn in listener.incoming().map_while(Result::ok) {
-            std::thread::spawn(move || {
-                let mut stream = conn;
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-                );
-            });
-        }
-    });
-    port
-}
+use common::{SANDBOX_RUN_LOCK, ai_jail, http_fixture};
 
 /// Run `bash -c <script>` inside a filtered-egress sandbox.
 fn filtered_run(
@@ -155,6 +42,17 @@ fn filtered_run_locked(
     lockdown: bool,
 ) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    filtered_run_holding_lock(allow_hosts, extra_env, script, lockdown)
+}
+
+/// The body of [`filtered_run_locked`], for a caller that already holds
+/// `SANDBOX_RUN_LOCK` and must keep holding it after the sandbox exits.
+fn filtered_run_holding_lock(
+    allow_hosts: &[&str],
+    extra_env: &[(&str, &str)],
+    script: &str,
+    lockdown: bool,
+) -> Output {
     let mut command = Command::new(ai_jail());
     command.args(["--clean", "--no-status-bar", "--exec"]);
     if lockdown {
@@ -185,6 +83,13 @@ fn filtered_run_locked(
 const CURL_RETRY: &str =
     "--retry 20 --retry-delay 0 --retry-connrefused --max-time 20";
 
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 #[test]
 fn filtered_egress_allowlisted_host_tunnels() {
     require_bwrap_net!();
@@ -194,7 +99,7 @@ fn filtered_egress_allowlisted_host_tunnels() {
         "echo \"PROXY=$http_proxy\"; \
          echo \"NOPROXY=${{no_proxy-unset}}\"; \
          ls -a /tmp; \
-         curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
+         curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
     );
     let output = filtered_run(&["127.0.0.1"], &[], &script);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -209,12 +114,8 @@ fn filtered_egress_allowlisted_host_tunnels() {
         "forced proxy env missing: {stdout:?}"
     );
     assert!(
-        stdout.contains("NOPROXY="),
-        "no_proxy not emptied: {stdout:?}"
-    );
-    assert!(
-        !stdout.contains("NOPROXY=unset"),
-        "no_proxy was unset instead of emptied: {stdout:?}"
+        stdout.contains("NOPROXY=127.0.0.1,localhost,::1"),
+        "Linux loopback bypass missing: {stdout:?}"
     );
     // Bytes flowed fixture -> proxy -> bridge -> child.
     assert!(stdout.contains("ok"), "fixture body missing: {stdout:?}");
@@ -238,7 +139,7 @@ fn filtered_egress_disallowed_host_gets_403() {
     // The fixture is reachable but NOT allowlisted; the allowlist
     // covers only 127.0.0.2 (nothing listens there).
     let script = format!(
-        "curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/ 2>&1; \
+        "curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/ 2>&1; \
          echo \"CURL_EXIT=$?\""
     );
     let output = filtered_run(&["127.0.0.2"], &[], &script);
@@ -326,10 +227,35 @@ fn filtered_egress_forced_env_wins_over_user_env() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("SEEN=http://127.0.0.1:15919/"),
+        stdout.contains("SEEN=http://127.0.0.1:15919/127.0.0.1,localhost,::1"),
         "user --env overrode the forced proxy env: stdout={stdout:?} \
          stderr={stderr:?}"
     );
+}
+
+#[test]
+fn filtered_egress_preserves_in_sandbox_loopback_services() {
+    require_bwrap_net!();
+    require_curl!();
+    if !python3_available() {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+
+    let script = format!(
+        "python3 -m http.server 18371 --bind 127.0.0.1 >/tmp/local-http.log 2>&1 & \
+         server=$!; trap 'kill $server' EXIT; \
+         curl -f -sS {CURL_RETRY} http://127.0.0.1:18371/ >/dev/null; \
+         echo LOCAL_LOOPBACK_OK"
+    );
+    let output = filtered_run(&["example.com"], &[], &script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sandbox loopback request failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(stdout.contains("LOCAL_LOOPBACK_OK"), "stdout={stdout:?}");
 }
 
 #[test]
@@ -344,7 +270,7 @@ fn filtered_egress_lockdown_still_tunnels() {
     let fixture = http_fixture();
     let script = format!(
         "echo \"PROXY=$http_proxy\"; \
-         curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
+         curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
     );
     let output = filtered_run_locked(&["127.0.0.1"], &[], &script, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -366,7 +292,11 @@ fn filtered_egress_lockdown_still_tunnels() {
 #[test]
 fn filtered_egress_bridge_does_not_outlive_sandbox() {
     require_bwrap_net!();
-    let output = filtered_run(&["127.0.0.1"], &[], "true");
+    // Hold the run lock through the /proc scan below, not just the run:
+    // released early, another test's sandbox (and its bridge) can start
+    // inside the scan window and be counted as this one's survivor.
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let output = filtered_run_holding_lock(&["127.0.0.1"], &[], "true", false);
     assert!(output.status.success());
 
     // The bridge is a process inside the sandbox's private pid
@@ -392,4 +322,35 @@ fn filtered_egress_bridge_does_not_outlive_sandbox() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn filtered_egress_bridge_survives_descriptor_exhaustion() {
+    require_bwrap_net!();
+    require_lockdown_tools!("bash", "python3");
+    // Under --lockdown NOFILE is 4096: flood the in-sandbox bridge until
+    // accepts start failing, release everything, and connect again. A
+    // failed accept used to end the bridge's accept loop for good, so
+    // every later connection was refused for the rest of the launch.
+    let script = "python3 -c '
+import socket, time
+held = []
+try:
+    while len(held) < 20000:
+        held.append(socket.create_connection((\"127.0.0.1\", 15919), timeout=2))
+except OSError:
+    pass
+for s in held:
+    s.close()
+time.sleep(1)
+socket.create_connection((\"127.0.0.1\", 15919), timeout=5).close()
+print(\"ALIVE after\", len(held))
+'";
+    let output = filtered_run_locked(&["example.invalid"], &[], script, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ALIVE"),
+        "bridge did not survive: stdout={stdout:?} stderr={stderr:?}"
+    );
 }

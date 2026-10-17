@@ -64,14 +64,40 @@ This is the single most important invariant of the project. Users generate `.ai-
   global config; broad home exposure requires explicit `--no-private-home`.
 - Network, GPU, display, X11, host shared memory, terminal passthrough, macOS
   host IPC, and worktree metadata are opt-in. Do not weaken these defaults.
-- Network is the one default with a built-in exception: when dev-toolchain
-  support is enabled (the default) and neither `--network` nor
-  `--no-network` is set, ai-jail default-allows filtered egress to a fixed
-  list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
-  `sandbox/mod.rs`) so dependency fetches work out of the box. This is gated
-  on an unprivileged network-namespace probe (`unprivileged_netns_available`)
-  that falls back to fully offline when unavailable, never to unrestricted
-  access. `--no-network` always forces strict offline regardless.
+- Network is the one default with two built-in filtered-egress exceptions,
+  both of which only ever _add named hosts to a deny-by-default allowlist_,
+  never open unrestricted access:
+  - Registry egress: when dev-toolchain support is enabled (the default) and
+    neither `--network` nor `--no-network` is set, ai-jail default-allows a
+    fixed list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
+    `sandbox/mod.rs`) so dependency fetches work out of the box. Linux-only.
+  - Agent API egress (issue #156): when the invoked command is a known API
+    agent with a canonical host in `command::api_host`
+    (`command::default_egress_host` exposes it — claude/codex/gemini/grok/devin) and
+    the posture is unset (no `--network`/`--no-network`, not `--lockdown`, not
+    a browser launch), ai-jail default-allows that one host so `ai-jail claude`
+    reaches its model API. Only the functional API host is added, never a
+    telemetry host, and it stays in lockstep with the capability-gap warning's
+    `api_host` table (the injection is exactly what silences that warning). Not
+    Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
+    applies there too.
+
+    Both defaults are gated on an unprivileged network-namespace probe
+    (`unprivileged_netns_available`) that falls back to fully offline when
+    unavailable, never to unrestricted access. Both are **unioned with** any
+    explicit `--allow-host` list, not suppressed by it — neither predicate
+    checks `allow_hosts`, only the asserted posture — so `--allow-host X claude`
+    keeps `api.anthropic.com` reachable alongside `X`. The verbatim "only this
+    list" mode is `--no-network --allow-host …`: `--no-network` sets `network`,
+    which disables both automatic defaults, while a non-empty `allow_hosts`
+    keeps `network_mode` filtered rather than fully offline. `--no-network`
+    with no filtered host list forces strict offline regardless.
+
+  - `--allow-private-host` / `allow_private_hosts` is a trusted-only, named-host
+    exception for private, unique-local, and carrier-grade NAT addresses. It
+    must never permit loopback, link-local, metadata, multicast, or unspecified
+    addresses, and an untrusted project config must never grant or extend it.
+
 - Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
   default) and the opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
@@ -114,11 +140,11 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 7. Display mounts (validated Wayland socket and optional X11; never the whole runtime directory)
 8. Audio mounts (`--audio`: validated PipeWire/PulseAudio sockets in the runtime dir, plus `/dev/snd`)
 9. systemd user bus mounts (`--systemd-user`, narrow explicit runtime sockets)
-10. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles)
+10. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles; Devin's existing XDG data/config roots are writable, followed by a self-bind of `cli` to prevent rename and a read-only bind of `cli/_versions`; a present but invalid/incomplete CLI tree falls back to a read-only data root, while an absent `cli` keeps externally installed Devin state writable)
 11. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 12. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 13. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-14. Command binary exemption (paths the sandbox would otherwise hide: under private home the command's own directory beneath `$HOME`, and always the NixOS system profile under the private `/run`)
+14. Command binary exemption (paths the sandbox would otherwise hide: under private home the command's own directory beneath `$HOME`, and always the NixOS system profile under the private `/run`; under private home, symlink hops of the command chain are recreated with `--symlink` using the verbatim host target text so symlink-following heuristics keep working — bun locates its app root via `package.json` in the dirname of the invoked executable, which a flattened `--ro-bind` broke (prime-agent ENOENT `package.json`) — and only the terminal real path is `--ro-bind`ed)
 15. Linked Git worktree metadata (validated, opt-in; common dir mounted first, then the nested per-worktree git dir — both writable outside lockdown, both read-only under it)
 16. SSH agent socket and `~/.ssh` exemption mounts
 17. Pictures mount
@@ -126,14 +152,14 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 19. Extra user mounts (`--map`, `--rw-map`)
 20. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 21. Project directory (pwd, rw or ro depending on mode)
-22. In-project user mounts (after the project bind)
+22. In-project agent-state mounts, then in-project user mounts (after the project bind; masks and deny overlays still follow both)
 23. In-project overlay maps (after the project bind)
 24. Mask overlays (`--mask` and hidden project `.ai-jail`)
 25. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
 26. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last of the discovered groups)
-27. Landlock wrapper self-mount and filtered-egress proxy socket (emitted after all discovered groups so the `/tmp` tmpfs already exists: ai-jail itself read-only at `/tmp/.ai-jail-landlock`, and in filtered mode a writable bind of the outer proxy's Unix socket to `/tmp/.ai-jail-proxy.sock` — only the socket file, never its temp dir)
+27. Landlock wrapper self-mount and filtered-egress proxy socket (emitted after all discovered groups so the `/tmp` tmpfs already exists: ai-jail itself read-only at `/tmp/.ai-jail-landlock`, and in filtered mode a writable bind of the outer proxy's Unix socket to `/tmp/.ai-jail-proxy.sock` — only the socket file, never its temp dir — and one writable bind per `--forward-port` of its host-side Unix socket to `/tmp/.ai-jail-forward.<port>.sock`)
 
-Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last among the discovered groups, after the project mount, so it masks the upper/work layers the project mount would otherwise expose. Group 27 is emitted programmatically at the end of `build`/`dry_run`, not discovered with the rest: both its members must sit on top of the `/tmp` tmpfs from group 1.
+Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last among the discovered groups, after the project mount, so it masks the upper/work layers the project mount would otherwise expose. Group 27 is emitted programmatically at the end of `build`/`dry_run`, not discovered with the rest: all its members must sit on top of the `/tmp` tmpfs from group 1.
 
 ## Before Committing
 

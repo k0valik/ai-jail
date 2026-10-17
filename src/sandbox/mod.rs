@@ -526,7 +526,6 @@ fn credential_ro_paths_from(
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for (enabled, path) in [
-        (config.github_enabled(), home.join(".config").join("gh")),
         (config.aws_enabled(), home.join(".aws")),
         (config.kube_enabled(), home.join(".kube")),
         (config.gcloud_enabled(), home.join(".config").join("gcloud")),
@@ -630,6 +629,11 @@ fn command_paths_under_impl(
                         None => break,
                     }
                 };
+                // A relative target may traverse with `..`; keep each
+                // hop lexically normalized so collected paths (mount
+                // destinations, containment checks, seatbelt rules)
+                // never carry `..` components.
+                cur = crate::config::normalize_path(&cur);
             }
             Err(_) => {
                 // Terminal: a regular file (or a broken link target —
@@ -657,6 +661,156 @@ fn xdg_config_home() -> PathBuf {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => home_dir().join(".config"),
     }
+}
+
+/// Devin uses XDG roots for both state and configuration. Resolve the
+/// explicit environment overrides as well as the host value so discovery
+/// agrees with the environment passed to the child.
+fn devin_env_value(config: &Config, key: &str) -> Option<String> {
+    // HOME and XDG_* are always in the default allowlist, so their values
+    // agree with full inheritance too. Reuse the child's override policy.
+    let host: Vec<_> = std::env::vars().collect();
+    crate::config::filtered_child_env(config.env_pass(), &host)
+        .into_iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+}
+
+fn devin_xdg_base(config: &Config, key: &str, fallback: &str) -> PathBuf {
+    let effective_home = devin_env_value(config, "HOME")
+        .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+        .map(PathBuf::from)
+        .unwrap_or_else(home_dir);
+    devin_env_value(config, key)
+        .filter(|v| !v.is_empty() && Path::new(v).is_absolute())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| effective_home.join(fallback))
+}
+
+fn devin_xdg_home(
+    config: &Config,
+    key: &str,
+    fallback: &str,
+) -> Option<PathBuf> {
+    // Never collapse .. lexically across a symlink. Only existing base
+    // directories can be shared; backends skip missing state directories.
+    std::fs::canonicalize(devin_xdg_base(config, key, fallback)).ok()
+}
+
+/// Discovery and child environment preparation may resolve a base repeatedly.
+/// Report failures once per launch, from platform_notes, without global state.
+fn devin_xdg_warnings(config: &Config) -> Vec<String> {
+    if crate::command::effective_name(&config.command) != Some("devin")
+        || !config.agent_state_enabled()
+        || config.browser_profile().is_some()
+    {
+        return Vec::new();
+    }
+    [("XDG_DATA_HOME", ".local/share"), ("XDG_CONFIG_HOME", ".config")]
+        .into_iter()
+        .filter_map(|(key, fallback)| {
+            let path = devin_xdg_base(config, key, fallback);
+            std::fs::canonicalize(&path).err().map(|error| format!(
+                "Devin: cannot resolve {key} base {}: {error}; state sharing skipped",
+                path.display()
+            ))
+        })
+        .collect()
+}
+
+/// Forward physical base paths so a private home need not expose the
+/// host's symlink aliases just to let Devin find its mounted state.
+fn devin_child_env(config: &Config) -> Vec<(String, String)> {
+    if crate::command::effective_name(&config.command) != Some("devin")
+        || config.lockdown_enabled()
+        || config.browser_profile().is_some()
+    {
+        return Vec::new();
+    }
+    [
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_CONFIG_HOME", ".config"),
+    ]
+    .into_iter()
+    .filter_map(|(key, fallback)| {
+        let path = devin_xdg_home(config, key, fallback)?;
+        path.is_dir()
+            .then(|| (key.into(), path.display().to_string()))
+    })
+    .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevinInstallation {
+    /// An externally installed CLI has no self-managed launcher tree here.
+    Absent,
+    Managed,
+    Invalid,
+}
+
+fn devin_installation(data: &Path) -> DevinInstallation {
+    match data.join("cli").symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DevinInstallation::Absent
+        }
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && data.join("cli/_versions").symlink_metadata().is_ok_and(
+                    |m| m.is_dir() && !m.file_type().is_symlink(),
+                ) =>
+        {
+            DevinInstallation::Managed
+        }
+        _ => DevinInstallation::Invalid,
+    }
+}
+
+fn devin_installation_dir(config: &Config) -> Option<PathBuf> {
+    devin_xdg_home(config, "XDG_DATA_HOME", ".local/share")
+        .map(|path| path.join("devin/cli/_versions"))
+}
+
+/// Candidates only: each backend preserves its own existing validation of
+/// missing paths and symlinks. Never create directories on the host.
+fn devin_state_paths(config: &Config) -> Vec<PathBuf> {
+    if crate::command::effective_name(&config.command) != Some("devin")
+        || !config.agent_state_enabled()
+        || config.browser_profile().is_some()
+    {
+        return Vec::new();
+    }
+    devin_candidate_paths(config)
+}
+
+fn devin_candidate_paths(config: &Config) -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut paths = Vec::new();
+    for (key, fallback, logical_top) in [
+        ("XDG_DATA_HOME", ".local/share", ".local"),
+        ("XDG_CONFIG_HOME", ".config", ".config"),
+    ] {
+        let Some(base) = devin_xdg_home(config, key, fallback) else {
+            continue;
+        };
+        let path = base.join("devin");
+        let actual_top = path
+            .strip_prefix(&home)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .and_then(|part| part.as_os_str().to_str());
+        let hidden = config.hide_dotdirs.iter().any(|hide| {
+            let hide = hide.strip_prefix('.').unwrap_or(hide);
+            hide == logical_top.strip_prefix('.').unwrap_or(logical_top)
+                || actual_top.is_some_and(|top| {
+                    top.strip_prefix('.').unwrap_or(top) == hide
+                })
+        });
+        if !hidden && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn path_exists(p: &Path) -> bool {
@@ -828,6 +982,10 @@ fn validate_linked_git_worktree(
     let common_dir_canon = std::fs::canonicalize(&common_dir).map_err(|e| {
         format!("cannot resolve commondir {}: {e}", common_dir.display())
     })?;
+    let project_dir_canon =
+        std::fs::canonicalize(project_dir).map_err(|e| {
+            format!("cannot resolve project dir {}: {e}", project_dir.display())
+        })?;
     let under_worktrees = git_dir_canon
         .parent()
         .filter(|worktrees| {
@@ -841,6 +999,24 @@ fn validate_linked_git_worktree(
              refusing to trust repository-authored worktree metadata",
             git_dir_canon.display(),
             common_dir_canon.display()
+        ));
+    }
+
+    // A real linked worktree stores its administrative directories outside
+    // the checkout. If either side contains the other, the repository can
+    // manufacture the entire circular layout itself and trick us into
+    // exposing a project ancestor (or more of the project) as host metadata.
+    // Refuse every overlap, not only the known `<project>/worktrees/...`
+    // spelling, so alternate nesting and symlink spellings fail closed.
+    let overlaps_project = |path: &Path| {
+        path.starts_with(&project_dir_canon)
+            || project_dir_canon.starts_with(path)
+    };
+    if overlaps_project(&git_dir_canon) || overlaps_project(&common_dir_canon) {
+        return Err(format!(
+            "worktree metadata overlaps project directory {}; refusing to \
+             trust repository-authored worktree metadata",
+            project_dir_canon.display()
         ));
     }
 
@@ -1014,7 +1190,10 @@ pub(crate) fn unprivileged_netns_available() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
-        std::process::Command::new("bwrap")
+        let Ok(bwrap) = bwrap::bwrap_binary_path() else {
+            return false;
+        };
+        std::process::Command::new(bwrap)
             .args([
                 "--ro-bind",
                 "/",
@@ -1409,6 +1588,9 @@ pub fn platform_notes(config: &Config) {
         );
     }
     warn_docker_passthrough(config);
+    for warning in devin_xdg_warnings(config) {
+        output::warn(&warning);
+    }
     #[cfg(target_os = "macos")]
     {
         seatbelt::platform_notes(config);
@@ -1493,6 +1675,7 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1503,19 +1686,20 @@ pub fn build(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
+            forward_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = guard;
+        let _ = (guard, forward_sockets);
         let prepared = prepare_seatbelt_config(config)?;
-        Ok(seatbelt::build(
+        seatbelt::build(
             &prepared,
             project_dir,
             verbose,
             sandbox_tty,
             proxy.map(|p| p.port()),
-        ))
+        )
     }
 }
 
@@ -1525,6 +1709,7 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
     proxy: Option<&crate::proxy::Proxy>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1534,11 +1719,12 @@ pub fn dry_run(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
+            forward_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = guard;
+        let _ = (guard, forward_sockets);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::dry_run(
             &prepared,
@@ -1564,6 +1750,171 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn devin_paths_follow_effective_xdg_and_preserve_gates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_test_dir("devin-paths");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::remove("XDG_DATA_HOME");
+        let _config = EnvVarGuard::remove("XDG_CONFIG_HOME");
+        let mut config = Config {
+            command: vec!["devin".into()],
+            ..Config::default()
+        };
+        assert!(devin_state_paths(&config).is_empty());
+        assert!(!home.exists(), "discovery must not create directories");
+        std::fs::create_dir_all(home.join(".local/share")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        assert_eq!(
+            devin_state_paths(&config),
+            vec![home.join(".local/share/devin"), home.join(".config/devin")]
+        );
+        let data = home.join("data");
+        let cfg = home.join("config");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        config.env_pass = vec![
+            format!("XDG_DATA_HOME={}", data.display()),
+            format!("XDG_CONFIG_HOME={}", cfg.display()),
+        ];
+        assert_eq!(
+            devin_state_paths(&config),
+            vec![data.join("devin"), cfg.join("devin")]
+        );
+        assert_eq!(
+            devin_installation_dir(&config),
+            Some(data.join("devin/cli/_versions"))
+        );
+        config.hide_dotdirs = vec!["local".into()];
+        assert_eq!(devin_state_paths(&config), vec![cfg.join("devin")]);
+        config.hide_dotdirs.clear();
+        config.agent_state = Some(false);
+        assert!(devin_state_paths(&config).is_empty());
+        config.agent_state = None;
+        config.lockdown = Some(true);
+        assert!(devin_state_paths(&config).is_empty());
+        config.lockdown = None;
+        config.command = vec!["claude".into()];
+        assert!(devin_state_paths(&config).is_empty());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn devin_installation_distinguishes_absent_tree_from_invalid_nodes() {
+        let data = temp_test_dir("devin-installation-kind");
+        std::fs::create_dir_all(&data).unwrap();
+        let cli = data.join("cli");
+        let versions = cli.join("_versions");
+        assert_eq!(devin_installation(&data), DevinInstallation::Absent);
+        assert!(!cli.exists());
+        std::fs::create_dir_all(&cli).unwrap();
+        assert_eq!(devin_installation(&data), DevinInstallation::Invalid);
+        std::fs::create_dir_all(&versions).unwrap();
+        assert_eq!(devin_installation(&data), DevinInstallation::Managed);
+        std::fs::remove_dir(&versions).unwrap();
+        std::os::unix::fs::symlink("missing", &versions).unwrap();
+        assert_eq!(devin_installation(&data), DevinInstallation::Invalid);
+        std::fs::remove_file(&versions).unwrap();
+        std::fs::write(&versions, "not a directory").unwrap();
+        assert_eq!(devin_installation(&data), DevinInstallation::Invalid);
+        std::fs::remove_dir_all(&cli).unwrap();
+        std::os::unix::fs::symlink("missing", &cli).unwrap();
+        assert_eq!(devin_installation(&data), DevinInstallation::Invalid);
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn devin_xdg_diagnostics_are_separate_from_discovery_and_respect_opt_out() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = temp_test_dir("devin-diagnostics");
+        let mut config = Config {
+            command: vec!["devin".into()],
+            env_pass: vec![
+                format!("XDG_DATA_HOME={}/data", root.display()),
+                format!("XDG_CONFIG_HOME={}/config", root.display()),
+            ],
+            ..Config::default()
+        };
+        assert!(devin_installation_dir(&config).is_none());
+        assert!(devin_state_paths(&config).is_empty());
+        assert!(devin_child_env(&config).is_empty());
+        let warnings = devin_xdg_warnings(&config);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("XDG_DATA_HOME"));
+        assert!(warnings[1].contains("XDG_CONFIG_HOME"));
+        config.agent_state = Some(false);
+        assert!(devin_xdg_warnings(&config).is_empty());
+        config.agent_state = None;
+        config.lockdown = Some(true);
+        assert!(devin_xdg_warnings(&config).is_empty());
+        config.lockdown = None;
+        config.browser_profile = Some("soft".into());
+        assert!(devin_xdg_warnings(&config).is_empty());
+        config.browser_profile = None;
+        config.command = vec!["claude".into()];
+        assert!(devin_xdg_warnings(&config).is_empty());
+        assert!(!root.exists(), "diagnostics must not create host paths");
+    }
+
+    #[test]
+    fn devin_xdg_empty_relative_bare_and_symlink_parent_entries() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_test_dir("devin-env");
+        std::fs::create_dir_all(home.join(".local/share")).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let host = home.join("host-data");
+        std::fs::create_dir_all(&host).unwrap();
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &host);
+        let mut config = Config {
+            command: vec!["devin".into()],
+            env_pass: vec!["XDG_DATA_HOME=".into()],
+            ..Config::default()
+        };
+        let fallback = Some(home.join(".local/share/devin/cli/_versions"));
+        assert_eq!(devin_installation_dir(&config), fallback);
+        config.env_pass.push("XDG_DATA_HOME".into());
+        assert_eq!(
+            devin_installation_dir(&config),
+            Some(host.join("devin/cli/_versions"))
+        );
+        config.env_pass = vec!["XDG_DATA_HOME=relative-data".into()];
+        assert_eq!(devin_installation_dir(&config), fallback);
+        assert!(devin_child_env(&config).contains(&(
+            "XDG_DATA_HOME".into(),
+            home.join(".local/share").display().to_string()
+        )));
+        let custom_home = home.join("custom-home");
+        std::fs::create_dir_all(custom_home.join(".local/share")).unwrap();
+        config.env_pass = vec![
+            "XDG_DATA_HOME=".into(),
+            format!("HOME={}", custom_home.display()),
+        ];
+        assert_eq!(
+            devin_installation_dir(&config),
+            Some(custom_home.join(".local/share/devin/cli/_versions"))
+        );
+        std::fs::create_dir_all(home.join("physical/nested")).unwrap();
+        std::fs::create_dir_all(home.join("physical/data")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join("physical/nested"),
+            home.join("alias"),
+        )
+        .unwrap();
+        config.env_pass =
+            vec![format!("XDG_DATA_HOME={}/alias/../data", home.display())];
+        assert_eq!(
+            devin_installation_dir(&config),
+            Some(home.join("physical/data/devin/cli/_versions"))
+        );
+        config.env_pass =
+            vec![format!("XDG_DATA_HOME={}/missing", home.display())];
+        assert!(devin_installation_dir(&config).is_none());
+        assert!(!home.join("missing").exists());
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
@@ -1607,13 +1958,22 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                home.join(".config").join("gh"),
                 home.join(".aws"),
                 home.join(".kube"),
                 home.join(".config").join("gcloud"),
                 home.join(".docker").join("config.json"),
             ]
         );
+    }
+
+    #[test]
+    fn generic_credential_mounts_do_not_add_a_second_github_config_path() {
+        let home = PathBuf::from("/home/u");
+        let config = Config {
+            github: Some(true),
+            ..Config::default()
+        };
+        assert!(credential_ro_paths_from(&config, &home, |_| true).is_empty());
     }
 
     #[test]
@@ -2622,6 +2982,35 @@ mod tests {
         assert!(
             discover_git_worktree_paths(&config, &project, false).is_none()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_metadata_nested_in_project_is_rejected() {
+        // A project can satisfy the structural `<common>/worktrees/<name>`
+        // check with directories it owns. That circular proof must never turn
+        // a project ancestor into a host-side worktree metadata mount.
+        let root = temp_test_dir("nested-worktree-metadata");
+        let common = root.join("project");
+        let project = common.join("worktrees/checkout");
+        let git_dir = common.join("worktrees/admin");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", project.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let err = validate_linked_git_worktree(&project).unwrap_err();
+        assert!(err.contains("overlaps project"), "unexpected error: {err}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

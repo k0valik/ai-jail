@@ -19,97 +19,13 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+mod common;
+
+use common::{SANDBOX_RUN_LOCK, ai_jail};
 
 static COMPILE_HELPER: OnceLock<bool> = OnceLock::new();
-// Keep integration tests deterministic when the developer's project
-// `.ai-jail` enables passthrough like `ssh = true`, and avoid parallel
-// bwrap mount races against the same project-local `.ai-jail` mask.
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
-
-// ── Runtime prerequisite checks ─────────────────
-//
-// bwrap needs unprivileged user namespaces which some kernels
-// restrict (Ubuntu 24.04+ AppArmor policy, Debian hardened
-// sysctl, etc.). Detect this at runtime so tests skip cleanly
-// instead of failing with confusing bwrap errors.
-
-/// Can bwrap create the namespaces needed for normal mode?
-fn bwrap_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// Can bwrap also create a network namespace (lockdown mode)?
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        bwrap_available()
-            && Command::new("bwrap")
-                .args([
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--proc",
-                    "/proc",
-                    "--unshare-pid",
-                    "--unshare-uts",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--",
-                    "true",
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-    })
-}
-
-macro_rules! require_bwrap {
-    () => {
-        if !bwrap_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create user namespaces \
-                 on this system (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-macro_rules! require_bwrap_net {
-    () => {
-        if !bwrap_net_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create network \
-                 namespaces on this system \
-                 (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
 
 fn helper_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -179,6 +95,110 @@ fn sandbox_run(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to spawn ai-jail")
+}
+
+#[test]
+fn bwrap_supervisor_does_not_retain_host_environment() {
+    require_bwrap!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let marker = format!("ai-jail-host-only-{}", std::process::id());
+    let output = Command::new(ai_jail())
+        .env("AI_JAIL_HOST_ONLY_SENTINEL", &marker)
+        .args([
+            "--clean",
+            "--no-landlock",
+            "--no-agent-state",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "sh",
+            "-c",
+            "tr '\\0' '\\n' </proc/1/environ; printf 'child=%s\\n' \"${AI_JAIL_HOST_ONLY_SENTINEL-unset}\"",
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(&marker),
+        "host-only marker leaked: {stdout}"
+    );
+    assert!(
+        stdout.contains("child=unset"),
+        "unexpected child environment: {stdout}"
+    );
+
+    let inherited = Command::new(ai_jail())
+        .env("AI_JAIL_HOST_ONLY_SENTINEL", &marker)
+        .args([
+            "--clean",
+            "--no-landlock",
+            "--inherit-env",
+            "--no-agent-state",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "sh",
+            "-c",
+            "printf 'child=%s\\n' \"$AI_JAIL_HOST_ONLY_SENTINEL\"",
+        ])
+        .output()
+        .expect("failed to spawn ai-jail with inherited environment");
+    assert!(
+        inherited.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&inherited.stdout),
+        format!("child={marker}\n")
+    );
+}
+
+#[test]
+fn netns_probe_never_executes_path_bwrap() {
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let root = helper_dir().join(format!("path-bwrap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("executed");
+    let fake = root.join("bwrap");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    let path = format!("{}:/usr/bin:/bin", root.display());
+
+    // Default toolchain egress invokes the network-namespace capability
+    // probe before a dry run. The probe must use the same trusted resolver as
+    // launch, never the first `bwrap` supplied by an untrusted PATH.
+    let _ = Command::new(ai_jail())
+        .env("PATH", path)
+        .args([
+            "--clean",
+            "--dry-run",
+            "--no-agent-state",
+            "--no-display",
+            "--no-status-bar",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run netns probe regression");
+    assert!(!marker.exists(), "PATH-selected bwrap was executed");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Run a command inside the sandbox (lockdown mode).

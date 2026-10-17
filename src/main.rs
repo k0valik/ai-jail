@@ -4,9 +4,12 @@ compile_error!("ai-jail only supports Linux and macOS");
 mod audit;
 mod bootstrap;
 mod cli;
+#[cfg(target_os = "macos")]
+mod codex_ps;
 mod command;
 mod config;
 mod fsutil;
+mod github_auth;
 mod output;
 mod proxy;
 mod pty;
@@ -98,6 +101,34 @@ fn apply_browser_profile(config: &mut config::Config, command_trusted: bool) {
     }
 }
 
+/// A one-line hint for a browser profile that will not get a window: on
+/// Linux the display is an explicit opt-in, and without it the browser
+/// exits with only its own "failed to connect to display" error. Silent
+/// when there is no display on the host to pass, under lockdown (which
+/// has its own warning above), and on macOS, where the display is
+/// system-level.
+fn browser_display_hint(
+    config: &config::Config,
+    host_has_display: bool,
+) -> Option<&'static str> {
+    (cfg!(target_os = "linux")
+        && host_has_display
+        && config.browser_profile().is_some()
+        && !config.lockdown_enabled()
+        && !config.display_enabled()
+        && !config.x11_enabled())
+    .then_some(
+        "ai-jail: browser profile without --display: the browser cannot \
+         open a window — pass --display (or --x11 for an X11-only browser)",
+    )
+}
+
+fn host_has_display() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+}
+
 /// Phantom credentials (issue #135): validate every `secret_hosts`
 /// binding and rewrite the bound `env_pass` entries to placeholders,
 /// moving the real values into supervisor-side `SecretBinding`s for the
@@ -129,9 +160,10 @@ fn prepare_secrets(
                 "--secret {key}: host must be a bare hostname, not {host:?}"
             ));
         }
-        if !proxy::allowlist_matches(config.allow_hosts(), &host) {
+        if !config.host_is_allowlisted(&host) {
             return Err(format!(
-                "--secret {key}: {host} is not in allow_hosts (pass --allow-host {host})"
+                "--secret {key}: {host} is not in allow_hosts or allow_private_hosts \
+                 (pass --allow-host {host} or --allow-private-host {host})"
             ));
         }
         // Resolve the value the child would actually receive. apply_env_pass
@@ -220,11 +252,47 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if !config.allow_tcp_ports().is_empty() {
         return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
     }
-    if config.network_enabled() && !config.allow_hosts().is_empty() {
-        return Err("--network and --allow-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
+    if config.network_enabled() && config.has_filtered_hosts() {
+        return Err("--network and --allow-host/--allow-private-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
     }
-    if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
-        return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
+    if config.browser_profile().is_some() && config.has_filtered_hosts() {
+        return Err("--browser and --allow-host/--allow-private-host cannot be combined: browsers need real DNS and many domains".into());
+    }
+    validate_forward_ports(config)
+}
+
+/// `--forward-port` contradiction checks, fail-closed at launch. A
+/// forward only means something while the host loopback is otherwise
+/// unreachable; the in-sandbox bridge port is taken; port 0 names no
+/// service.
+fn validate_forward_ports(config: &config::Config) -> Result<(), String> {
+    if config.forward_ports().is_empty() {
+        return Ok(());
+    }
+    if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+        return Err(
+            "--forward-port is supported on Linux and macOS only".into()
+        );
+    }
+    if config.network_enabled() {
+        return Err("--network and --forward-port are mutually exclusive: with unrestricted network the host's loopback is already reachable".into());
+    }
+    for &port in config.forward_ports() {
+        if port == 0 {
+            return Err("--forward-port 0 is not a port".into());
+        }
+        // The Linux netns keeps ip_unprivileged_port_start (1024) and the
+        // bridge port; macOS refuses the same ports so one entry fits both.
+        if port < 1024 {
+            return Err(format!(
+                "--forward-port {port}: ports below 1024 are not supported"
+            ));
+        }
+        if port == proxy::BRIDGE_PORT {
+            return Err(format!(
+                "--forward-port {port} is reserved for the proxy bridge"
+            ));
+        }
     }
     Ok(())
 }
@@ -325,6 +393,26 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+/// Give a launch of a known API agent (one with a canonical API host in
+/// `command::default_egress_hosts`) filtered egress to those hosts whenever the
+/// user has not asserted a network posture (issue #156). Like the
+/// package-registry default, this is _unioned_ with any explicit `--allow-host`
+/// list rather than suppressed by it: adding a host (`--allow-host github.com
+/// claude`) keeps the agent's own API reachable, which is almost always what
+/// the user meant. The verbatim "exactly this list, nothing automatic" mode is
+/// `--no-network --allow-host …`, which sets `network` and so disables both
+/// this and the registry default while still composing to filtered egress. The
+/// sandbox stays deny-by-default; `--network`, `--lockdown`, and browser
+/// launches keep their existing semantics. Unlike the registry default this is
+/// not Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
+/// applies there too.
+fn default_agent_api_egress_applies(config: &config::Config) -> bool {
+    !command::default_egress_hosts(&config.command).is_empty()
+        && config.network.is_none()
+        && !config.lockdown_enabled()
+        && config.browser_profile.is_none()
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -368,7 +456,17 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // below -- exits.
     #[cfg(target_os = "linux")]
     if let Some(port) = cli.proxy_bridge_port {
-        spawn_proxy_bridge(port)?;
+        spawn_bridge(
+            port,
+            std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH),
+            false,
+        )?;
+    }
+    // Port forwards: the same bridge, one per port, pumping into the
+    // host-side forward socket bwrap mounted at the per-port path.
+    #[cfg(target_os = "linux")]
+    for &port in config.forward_ports() {
+        spawn_bridge(port, &proxy::forward_in_sandbox_path(port), true)?;
     }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
@@ -422,28 +520,58 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
 }
 
-/// Spawn the in-sandbox proxy bridge as a child of the landlock
-/// wrapper. Fatal on spawn failure: without the bridge, filtered egress
-/// silently means "no egress at all", which is not what the launch
-/// asked for. The child is never reaped or waited on -- it lives
-/// exactly as long as the sandbox's pid namespace (see the call site).
+/// Spawn an in-sandbox bridge (127.0.0.1:<port> -> Unix `socket`) as a
+/// child of the landlock wrapper: the filtered-egress proxy bridge, or a
+/// `--forward-port` bridge. Fatal on spawn failure: without the bridge,
+/// the port the launch asked for silently leads nowhere. The child is
+/// never reaped or waited on -- it lives exactly as long as the
+/// sandbox's pid namespace (see the call site).
+///
+/// With `wait_ready`, also fatal when the bridge cannot bind, and the
+/// agent is not exec'd until the port is listening: the bridge reports
+/// `ready` on a piped stdout once bound, and exits (EOF) if it cannot.
+/// Without it (the proxy bridge) behaviour is unchanged: the bridge
+/// inherits the agent's stdout, which it must never write to.
 #[cfg(target_os = "linux")]
-fn spawn_proxy_bridge(port: u16) -> Result<(), String> {
+fn spawn_bridge(
+    port: u16,
+    socket: &std::path::Path,
+    wait_ready: bool,
+) -> Result<(), String> {
+    use std::io::BufRead;
     let exe = std::env::current_exe().map_err(|e| {
-        format!("Cannot resolve ai-jail binary for the proxy bridge: {e}")
+        format!("Cannot resolve ai-jail binary for the bridge on {port}: {e}")
     })?;
-    std::process::Command::new(exe)
-        .args([
-            "--proxy-bridge",
-            port.to_string().as_str(),
-            proxy::IN_SANDBOX_SOCK_PATH,
-        ])
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--proxy-bridge")
+        .arg(port.to_string())
+        .arg(socket)
         // The internal-mode marker --proxy-bridge refuses to run
         // without; an agent that can already reach the proxy socket
         // gains nothing by setting it itself.
-        .env("AI_JAIL_PROXY_BRIDGE", "1")
+        .env("AI_JAIL_PROXY_BRIDGE", "1");
+    if wait_ready {
+        command
+            .env(proxy::BRIDGE_READY_ENV, "1")
+            .stdout(std::process::Stdio::piped());
+    }
+    let mut child = command
         .spawn()
-        .map_err(|e| format!("Failed to spawn the proxy bridge: {e}"))?;
+        .map_err(|e| format!("Failed to spawn the bridge on {port}: {e}"))?;
+    if wait_ready {
+        let mut line = String::new();
+        let ready = child
+            .stdout
+            .take()
+            .map(|out| std::io::BufReader::new(out).read_line(&mut line))
+            .is_some_and(|r| r.is_ok());
+        if !ready || line.trim() != "ready" {
+            return Err(format!(
+                "--forward-port {port}: the in-sandbox bridge did not come up"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -622,13 +750,6 @@ fn run() -> Result<i32, String> {
     for warning in security_warnings {
         output::security_warn(&warning);
     }
-    // Capability gaps for known API-client agents (issue #131): warn at
-    // launch so an upgrade that flips a default does not fail silently.
-    // `output::warn` respects --exec quiet mode like other non-security
-    // warnings; the launch itself is never blocked.
-    for warning in command::capability_gap_warnings(&config) {
-        output::warn(&warning);
-    }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
     // #54). Done here so display_status and the --init save path see
@@ -727,6 +848,25 @@ fn run() -> Result<i32, String> {
         }
     }
 
+    // Default-allow a known API agent's own functional hosts (filtered
+    // egress) when the user asserted no network posture (issue #156), so
+    // `ai-jail claude` / `ai-jail codex` reaches its model API out of the box
+    // without opening the whole network. Only the agent's canonical API hosts
+    // are added, and they are UNIONED with any explicit --allow-host list (like the
+    // registry hosts below) rather than suppressed by it — `--no-network
+    // --allow-host …` is the verbatim escape hatch. The sandbox stays
+    // deny-by-default. Gated on the same netns probe as registry egress (always
+    // available on macOS, where filtered egress is a seatbelt loopback rule).
+    if default_agent_api_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::default_egress_hosts(&config.command) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push(host.to_string());
+            }
+        }
+    }
+
     // Default-allow the package registries (filtered egress) so dependency
     // fetches work without the user passing --allow-host. Deny-by-default still
     // holds: only these hosts become reachable. An explicit --allow-host set is
@@ -744,7 +884,21 @@ fn run() -> Result<i32, String> {
         }
     }
 
-    // Opt-in, read-only credential passthrough (github/aws/kube/gcloud/
+    // Capability gaps for known API-client agents (issue #131): warn at
+    // launch so an upgrade that flips a default does not fail silently. Done
+    // after the default egress policy above so an agent that just received its
+    // documented API host by default does not also draw a stale "network is
+    // off" / "API host not in allow_hosts" warning. `output::warn` respects
+    // --exec quiet mode like other non-security warnings; the launch itself is
+    // never blocked.
+    for warning in command::capability_gap_warnings(&config) {
+        output::warn(&warning);
+    }
+    if let Some(hint) = browser_display_hint(&config, host_has_display()) {
+        output::warn(hint);
+    }
+
+    // Opt-in, read-only credential passthrough (aws/kube/gcloud/
     // docker_config): off by default, disabled under --lockdown. Injected
     // here, after the status/--init/bootstrap early returns and the save
     // paths, so these derived, host-specific paths are never written into
@@ -797,6 +951,22 @@ fn run() -> Result<i32, String> {
         config.env_pass = env_pass;
     }
 
+    // The GitHub config directory may live under GH_CONFIG_DIR or
+    // XDG_CONFIG_HOME, and its active token may live in the host keyring.
+    // Resolve both after --env-from-file is applied, but never fetch a token
+    // for dry-run. These derived values are used for this launch only.
+    let github =
+        github_auth::prepare(&mut config, &invocation_cwd, cli.dry_run);
+    if let Some(path) = github.config_dir.filter(|path| path.is_dir()) {
+        let spec = path.to_string_lossy().into_owned();
+        if !toolchain_dest_already_mapped(&config, &spec) {
+            config.ro_maps.push(path);
+        }
+    }
+    if let Some(warning) = github.warning {
+        output::warn(warning);
+    }
+
     // Phantom credentials (issue #135): each bound key's env_pass entry
     // is rewritten to a placeholder the sandbox sees; the real value
     // moves into a supervisor-side SecretBinding for the egress proxy.
@@ -841,8 +1011,11 @@ fn run() -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
-        let mut proxy_config =
-            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        let mut allowlist = config.allow_hosts().to_vec();
+        allowlist.extend(config.allow_private_hosts().iter().cloned());
+        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+        proxy_config.allow_private_hosts =
+            config.allow_private_hosts().to_vec();
         // Test-only escape hatches (tests/filtered_egress.rs,
         // tests/phantom_secrets.rs): let the end-to-end tests CONNECT to
         // loopback fixtures and trust a self-signed root. These are compiled
@@ -865,8 +1038,11 @@ fn run() -> Result<i32, String> {
     #[cfg(target_os = "macos")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
-        let mut proxy_config =
-            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        let mut allowlist = config.allow_hosts().to_vec();
+        allowlist.extend(config.allow_private_hosts().iter().cloned());
+        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+        proxy_config.allow_private_hosts =
+            config.allow_private_hosts().to_vec();
         proxy_config.audit = audit_log.clone();
         proxy_config.secrets = secrets;
         let proxy = proxy::Proxy::start(proxy_config, None)
@@ -875,6 +1051,27 @@ fn run() -> Result<i32, String> {
     } else {
         None
     };
+
+    // Port forwards (Linux): one host-side Unix listener per port, bound
+    // before the sandbox is built so bwrap can mount each socket. Like the
+    // proxy handle, they must outlive the child (dropping unlinks them).
+    #[cfg(target_os = "linux")]
+    let port_forwards = config
+        .forward_ports()
+        .iter()
+        .map(|&port| {
+            proxy::PortForward::start(port, cli.verbose).map_err(|e| {
+                format!("Failed to start the forward for port {port}: {e}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(target_os = "linux")]
+    let forward_sockets: Vec<(u16, std::path::PathBuf)> = port_forwards
+        .iter()
+        .map(|f| (f.port(), f.unix_path().to_path_buf()))
+        .collect();
+    #[cfg(not(target_os = "linux"))]
+    let forward_sockets: Vec<(u16, std::path::PathBuf)> = Vec::new();
 
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
@@ -888,7 +1085,7 @@ fn run() -> Result<i32, String> {
             project_config,
             &invocation_cwd,
         );
-        config::save_auto(&to_save);
+        config::save_auto(&to_save, project_trusted, &invocation_cwd);
     }
 
     // Handle dry run
@@ -899,6 +1096,7 @@ fn run() -> Result<i32, String> {
             &project_dir,
             cli.verbose,
             egress_proxy.as_ref(),
+            &forward_sockets,
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -994,6 +1192,7 @@ fn run() -> Result<i32, String> {
         cli.verbose,
         sandbox_tty.as_deref(),
         egress_proxy.as_ref(),
+        &forward_sockets,
     )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
@@ -1085,10 +1284,12 @@ fn run() -> Result<i32, String> {
             config::NetworkMode::Filtered => "filtered",
             config::NetworkMode::Full => "full",
         };
+        let mut audit_allow_hosts = config.allow_hosts().to_vec();
+        audit_allow_hosts.extend(config.allow_private_hosts().iter().cloned());
         log.record(audit::launch_record(&audit::LaunchRecord {
             command: &config.command,
             network_mode: network,
-            allow_hosts: config.allow_hosts(),
+            allow_hosts: &audit_allow_hosts,
             lockdown: config.lockdown_enabled(),
             agent_state: config.agent_state_enabled(),
             gpu: config.gpu_enabled(),
@@ -1118,6 +1319,11 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if codex_ps::is_compat_invocation() {
+        std::process::exit(codex_ps::run());
+    }
+
     match run() {
         Ok(code) => std::process::exit(code),
         Err(msg) => {
@@ -1130,7 +1336,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_browser_profile, command_is_browser, command_needs_direct_tty,
+        apply_browser_profile, browser_display_hint, command_is_browser,
+        command_needs_direct_tty, default_agent_api_egress_applies,
         default_registry_egress_applies, default_resize_redraw_key,
         exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
         prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
@@ -1186,6 +1393,75 @@ mod tests {
     }
 
     #[test]
+    fn default_agent_api_egress_follows_the_api_host_table() {
+        // A bare launch of a known API agent with a canonical host applies,
+        // on both platforms (macOS filtered egress is a seatbelt loopback).
+        for agent in ["claude", "codex", "gemini", "grok", "devin"] {
+            assert!(
+                default_agent_api_egress_applies(&Config {
+                    command: vec![agent.into()],
+                    ..Config::default()
+                }),
+                "{agent} should receive its default API host"
+            );
+        }
+        // An agent with no canonical API host (opencode) gets nothing.
+        assert!(!default_agent_api_egress_applies(&Config {
+            command: vec!["opencode".into()],
+            ..Config::default()
+        }));
+        // A non-agent command gets nothing.
+        assert!(!default_agent_api_egress_applies(&Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        }));
+    }
+
+    #[test]
+    fn default_agent_api_egress_only_when_posture_unset() {
+        let claude = |f: fn(&mut Config)| {
+            let mut c = Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            };
+            f(&mut c);
+            c
+        };
+        // Baseline bare claude applies.
+        assert!(default_agent_api_egress_applies(&claude(|_| {})));
+        // --no-network keeps the sandbox fully offline.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(false);
+        })));
+        // Verbatim escape hatch: --no-network with an explicit --allow-host
+        // list composes to filtered egress but suppresses the automatic API
+        // host, so the launch reaches only the named hosts.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(false);
+            c.allow_hosts = vec!["github.com".into()];
+        })));
+        // --network is unrestricted; no filtered-egress injection.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(true);
+        })));
+        // An explicit --allow-host list is UNIONED with the agent's own API
+        // host (like registry egress), not suppressed by it, so long as no
+        // network posture is set. `--no-network --allow-host …` is the verbatim
+        // escape hatch, and sets `network` (covered by the --no-network case).
+        assert!(default_agent_api_egress_applies(&claude(|c| {
+            c.allow_hosts = vec!["example.com".into()];
+        })));
+        // Lockdown stays offline.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.lockdown = Some(true);
+        })));
+        // Browser launches need real DNS, not filtered egress.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.browser_profile = Some("hard".into());
+        })));
+    }
+
+    #[test]
     fn crush_requires_direct_tty() {
         assert!(command_needs_direct_tty(&["crush".into()]));
         assert!(command_needs_direct_tty(&["/usr/bin/crush".into()]));
@@ -1203,6 +1479,38 @@ mod tests {
     }
 
     #[test]
+    fn forward_port_contradictions_hard_error() {
+        let with_network = Config {
+            network: Some(true),
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&with_network).unwrap_err();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(error.contains("mutually exclusive"), "{error}");
+        } else {
+            assert!(error.contains("Linux and macOS only"), "{error}");
+        }
+        for port in [0, 80, 443, 1023, crate::proxy::BRIDGE_PORT] {
+            let config = Config {
+                forward_ports: vec![port],
+                ..Config::default()
+            };
+            assert!(validate_network_flags(&config).is_err(), "port {port}");
+        }
+        let ok = Config {
+            forward_ports: vec![49374],
+            allow_hosts: vec!["api.anthropic.com".into()],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(
+            validate_network_flags(&ok).is_ok(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[test]
     fn network_and_allow_host_contradiction_hard_errors() {
         let config = Config {
             network: Some(true),
@@ -1211,6 +1519,13 @@ mod tests {
         };
         let error = validate_network_flags(&config).unwrap_err();
         assert!(error.contains("mutually exclusive"));
+
+        let private = Config {
+            network: Some(true),
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&private).is_err());
     }
 
     #[test]
@@ -1223,6 +1538,13 @@ mod tests {
         let error = validate_network_flags(&config).unwrap_err();
         assert!(error.contains("--browser"));
         assert!(error.contains("--allow-host"));
+
+        let private = Config {
+            browser_profile: Some("hard".into()),
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&private).is_err());
     }
 
     #[test]
@@ -1274,7 +1596,7 @@ mod tests {
             ..Config::default()
         };
         let error = super::prepare_secrets(&mut config).unwrap_err();
-        assert!(error.contains("not in allow_hosts"));
+        assert!(error.contains("not in allow_hosts or allow_private_hosts"));
 
         // Scheme/path in the host is rejected.
         let mut config = Config {
@@ -1493,6 +1815,47 @@ mod tests {
         apply_browser_profile(&mut config, /* command_trusted */ true);
         assert_eq!(config.lockdown, Some(false));
         assert_eq!(config.browser_profile.as_deref(), Some("hard"));
+    }
+
+    #[test]
+    fn browser_display_hint_only_when_a_window_cannot_open() {
+        let browser = |extra: fn(&mut Config)| {
+            let mut config = Config {
+                command: vec!["chromium".into()],
+                ..Config::default()
+            };
+            apply_browser_profile(&mut config, true);
+            extra(&mut config);
+            config
+        };
+        let linux = cfg!(target_os = "linux");
+
+        // A browser profile with no --display on a host that has one.
+        assert_eq!(
+            browser_display_hint(&browser(|_| {}), true).is_some(),
+            linux
+        );
+        // Display or X11 passed: the browser can open a window.
+        assert!(
+            browser_display_hint(
+                &browser(|c| c.no_display = Some(false)),
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            browser_display_hint(&browser(|c| c.x11 = Some(true)), true)
+                .is_none()
+        );
+        // No display on the host: nothing to pass.
+        assert!(browser_display_hint(&browser(|_| {}), false).is_none());
+        // Lockdown kept for an untrusted browser command warns on its own.
+        assert!(
+            browser_display_hint(&browser(|c| c.lockdown = Some(true)), true)
+                .is_none()
+        );
+        // Not a browser launch.
+        assert!(browser_display_hint(&Config::default(), true).is_none());
     }
 
     #[test]

@@ -174,8 +174,8 @@ pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
 
 /// Agents known to be network API clients. Kept in sync with the
 /// per-agent state-path tables in the sandbox backends
-/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`); kimi
-/// binaries are matched by prefix like those tables do.
+/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`) and Devin's
+/// XDG state helper; kimi binaries are matched by prefix like those tables do.
 const KNOWN_API_AGENTS: &[&str] = &[
     "claude",
     "codex",
@@ -184,10 +184,12 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "crush",
     "grok",
     "jcode",
+    "devin",
     "pi",
     "aider",
     "soulforge",
     "omp",
+    "kiro-cli",
 ];
 
 fn is_known_api_agent(name: &str) -> bool {
@@ -203,8 +205,27 @@ fn api_host(name: &str) -> Option<&'static str> {
         "codex" => Some("api.openai.com"),
         "gemini" => Some("generativelanguage.googleapis.com"),
         "grok" => Some("api.x.ai"),
+        "devin" => Some("server.codeium.com"),
         _ => None,
     }
+}
+
+/// The functional hosts to default-allow (filtered egress) for a bare launch
+/// of a known API agent. Codex also needs chatgpt.com for ChatGPT OAuth
+/// workspace routing; api.openai.com alone only covers API-key traffic.
+/// Telemetry hosts are deliberately not default-allowed.
+pub(crate) fn default_egress_hosts(command: &[String]) -> Vec<&'static str> {
+    let Some(name) = effective_name(command) else {
+        return Vec::new();
+    };
+    let Some(host) = api_host(name) else {
+        return Vec::new();
+    };
+    let mut hosts = vec![host];
+    if name == "codex" {
+        hosts.push("chatgpt.com");
+    }
+    hosts
 }
 
 /// The well-known API-key environment variable(s) a harness reads, so that a
@@ -254,7 +275,7 @@ pub(crate) fn capability_gap_warnings(
     }
     if filtered
         && let Some(host) = api_host(name)
-        && !crate::proxy::allowlist_matches(config.allow_hosts(), host)
+        && !config.host_is_allowlisted(host)
     {
         warnings.push(format!(
             "ai-jail: filtered egress is on but `{name}`'s API host \
@@ -266,14 +287,19 @@ pub(crate) fn capability_gap_warnings(
     // `ai-jail <harness>` already mounts the harness's login/session data.
     // `--no-agent-state` and `--lockdown` disable it deliberately, so nudging
     // toward `--agent-state` there would just contradict the user's choice.
+    let opencode_service = config
+        .command
+        .windows(2)
+        .any(|args| args[0] == "serve" && args[1] == "--service");
     if name == "opencode"
         && !config.command.iter().any(|arg| arg == "--standalone")
+        && !opencode_service
     {
         warnings.push(
-            "ai-jail: opencode 2.x runs as a client of a shared background \
-             server, which does not survive the jail — if startup hangs at \
-             \"Starting background server\", add `--standalone` to the \
-             command (issue #137)"
+            "ai-jail: opencode 2.x needs `--standalone` or a shared service; \
+             for pair/web, keep `ai-jail opencode serve --service` running in \
+             another terminal, then run the client in a second jail (issues \
+             #137, #176)"
                 .to_string(),
         );
     }
@@ -533,15 +559,18 @@ mod tests {
 
     #[test]
     fn capability_gap_warns_opencode_without_standalone() {
-        // Issue #137: opencode 2.x is a client of a shared background
-        // server that does not survive the jail; --standalone avoids it.
+        // Issues #137 and #176: standalone is simplest, while pair/web uses a
+        // long-running service in another jail through shared agent state.
         let mut config = gap_config("opencode", Some(true), Some(true));
         let warnings = capability_gap_warnings(&config);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--standalone"));
-        assert!(warnings[0].contains("#137"));
+        assert!(warnings[0].contains("#176"));
 
         config.command = args(&["opencode", "--standalone"]);
+        assert!(capability_gap_warnings(&config).is_empty());
+
+        config.command = args(&["opencode", "serve", "--service"]);
         assert!(capability_gap_warnings(&config).is_empty());
     }
 
@@ -602,11 +631,54 @@ mod tests {
     }
 
     #[test]
+    fn devin_uses_existing_api_warning_policy() {
+        let mut config = gap_config("devin", None, None);
+        assert!(capability_gap_warnings(&config)[0].contains("network is off"));
+        config.allow_hosts = vec!["github.com".into()];
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("server.codeium.com"));
+        config.allow_hosts = vec!["server.codeium.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+        assert!(!config.network_enabled());
+        assert!(harness_api_key_env("devin").is_empty());
+    }
+
+    #[test]
     fn capability_gap_filtered_mode_silent_without_known_api_host() {
         // Agents with no canonical API host in the table get no
         // host-coverage warning in filtered mode.
         let mut config = gap_config("kimi", None, Some(true));
         config.allow_hosts = vec!["example.com".into()];
         assert!(capability_gap_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn default_egress_host_matches_api_host_table() {
+        assert_eq!(
+            default_egress_hosts(&["devin".into()]),
+            vec!["server.codeium.com"]
+        );
+        // Each agent's default egress host is exactly its api_host entry, so
+        // injecting it (issue #156) silences the filtered-mode gap warning.
+        assert_eq!(
+            default_egress_hosts(&["claude".into()]),
+            vec!["api.anthropic.com"]
+        );
+        assert_eq!(
+            default_egress_hosts(&["codex".into()]),
+            vec!["api.openai.com", "chatgpt.com"]
+        );
+        assert_eq!(default_egress_hosts(&["grok".into()]), vec!["api.x.ai"]);
+        // Resolved through the same harness/basename logic as warnings.
+        assert_eq!(
+            default_egress_hosts(&["/usr/bin/claude".into()]),
+            vec!["api.anthropic.com"]
+        );
+        // Agents without a canonical host, and non-agents, get nothing — no
+        // half-working default allowlist is injected.
+        assert!(default_egress_hosts(&["opencode".into()]).is_empty());
+        assert!(default_egress_hosts(&["kimi".into()]).is_empty());
+        assert!(default_egress_hosts(&["bash".into()]).is_empty());
     }
 }

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::output;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -85,8 +86,15 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy_port: Option<u16>,
-) -> Command {
+) -> Result<Command, String> {
     let lockdown = config.lockdown_enabled();
+    let codex_ps_shim = if !lockdown
+        && crate::command::effective_name(&config.command) == Some("codex")
+    {
+        Some(prepare_codex_ps_shim()?)
+    } else {
+        None
+    };
     let profile =
         build_profile(config, project_dir, verbose, sandbox_tty, proxy_port);
     let launch = super::build_launch_command(config);
@@ -98,7 +106,7 @@ pub fn build(
     cmd.args(&launch.args);
     cmd.current_dir(project_dir);
 
-    apply_child_env(&mut cmd, config, proxy_port);
+    apply_child_env(&mut cmd, config, proxy_port, codex_ps_shim.as_deref());
 
     // The profile only grants RW inside the dedicated session scratch
     // dir; TMPDIR must point there or every temp operation in the
@@ -107,7 +115,58 @@ pub fn build(
         cmd.env("TMPDIR", tmpdir);
     }
 
-    cmd
+    Ok(cmd)
+}
+
+/// Install an unprivileged `ps` entry point in this session's private temp
+/// directory. macOS's `/bin/ps` is setuid and Seatbelt rejects its exec; the
+/// ai-jail binary handles only Codex's narrow PID-validation query.
+fn prepare_codex_ps_shim() -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tmpdir) = macos_session_tmpdir() else {
+        return Err(
+            "Cannot prepare Codex ps helper without a session temp dir".into(),
+        );
+    };
+    let executable = std::env::current_exe().map_err(|e| {
+        format!("Cannot resolve ai-jail for Codex ps helper: {e}")
+    })?;
+    let executable = std::fs::canonicalize(&executable).map_err(|e| {
+        format!(
+            "Cannot canonicalize ai-jail for Codex ps helper {}: {e}",
+            executable.display()
+        )
+    })?;
+    let bin_dir = tmpdir.join("codex-bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| {
+        format!(
+            "Cannot create Codex helper directory {}: {e}",
+            bin_dir.display()
+        )
+    })?;
+    std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| {
+            format!(
+                "Cannot secure Codex helper directory {}: {e}",
+                bin_dir.display()
+            )
+        })?;
+    let ps = bin_dir.join("ps");
+    match std::fs::remove_file(&ps) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot replace Codex ps helper {}: {error}",
+                ps.display()
+            ));
+        }
+    }
+    std::os::unix::fs::symlink(&executable, &ps).map_err(|e| {
+        format!("Cannot install Codex ps helper {}: {e}", ps.display())
+    })?;
+    Ok(bin_dir)
 }
 
 /// Build the child environment from the shared allowlist in
@@ -121,11 +180,12 @@ fn apply_child_env(
     cmd: &mut Command,
     config: &Config,
     proxy_port: Option<u16>,
+    codex_ps_shim: Option<&Path>,
 ) {
     cmd.env_clear();
 
     let host_env: Vec<(String, String)> = std::env::vars().collect();
-    let env = if config.inherit_env_enabled() {
+    let mut env = if config.inherit_env_enabled() {
         // The whole parent environment, secrets included — that is what
         // the opt-in means. Starting from an empty vector here handed the
         // child nothing at all (not even PATH), because `env_clear` above
@@ -137,8 +197,36 @@ fn apply_child_env(
     } else {
         crate::config::filtered_child_env(config.env_pass(), &host_env)
     };
+
+    if let Some(shim_dir) = codex_ps_shim
+        && let Some((_, path)) = env.iter_mut().find(|(key, _)| key == "PATH")
+    {
+        let mut paths = vec![shim_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(OsStr::new(path)));
+        if let Ok(joined_path) = std::env::join_paths(paths) {
+            *path = joined_path.to_string_lossy().into_owned();
+        }
+    }
     for (key, value) in env {
         cmd.env(key, value);
+    }
+
+    // Claude Code looks up its macOS Keychain item using the login name as
+    // the item account. Keep USER filtered for other tools, but preserve it
+    // for Claude's explicit agent-state passthrough when the caller did not
+    // already choose a value through --env.
+    let claude_agent_state = !config.lockdown_enabled()
+        && config.agent_state_enabled()
+        && crate::command::effective_name(&config.command) == Some("claude");
+    if claude_agent_state
+        && !config.env_pass().iter().any(|entry| {
+            crate::config::parse_env_entry(entry)
+                .is_ok_and(|(name, _)| name == "USER")
+        })
+        && let Some((_, value)) =
+            host_env.iter().find(|(name, _)| name == "USER")
+    {
+        cmd.env("USER", value);
     }
 
     if config.lockdown_enabled() {
@@ -152,6 +240,8 @@ fn apply_child_env(
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
 
+    cmd.envs(super::devin_child_env(config));
+
     // Filtered egress: force the proxy env onto the child, pointing at
     // the outer proxy's loopback TCP port. Emitted after the env_pass
     // application above: Command::env replaces earlier values, so a
@@ -160,7 +250,9 @@ fn apply_child_env(
     if config.network_mode() == crate::config::NetworkMode::Filtered
         && let Some(port) = proxy_port
     {
-        for (key, value) in crate::proxy::env_vars(port) {
+        for (key, value) in
+            crate::proxy::env_vars(port, config.forward_ports(), false)
+        {
             cmd.env(key, value);
         }
     }
@@ -324,6 +416,7 @@ fn generate_sbpl_profile_for_tty(
             .filter(|p| super::path_exists(p))
             .cloned(),
     );
+    let devin_installation_paths = devin_installation_write_denies(config);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -334,7 +427,10 @@ fn generate_sbpl_profile_for_tty(
         config.macos_host_ipc_enabled(),
         sandbox_tty,
     );
+    push_claude_keychain_section(&mut profile, config);
+    push_codex_mach_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
+    push_codex_control_socket_section(&mut profile, config);
     let is_claude =
         crate::command::effective_name(&config.command) == Some("claude");
     push_file_read_section(
@@ -353,8 +449,33 @@ fn generate_sbpl_profile_for_tty(
         is_claude,
     );
     push_docker_section(&mut profile, docker_active(config, lockdown));
+    // This must follow all write grants, including the optional Docker socket
+    // rule emitted above, because SBPL uses last-match-wins semantics.
+    push_devin_installation_write_denies(
+        &mut profile,
+        &devin_installation_paths,
+    );
 
     profile
+}
+
+/// Let Claude use the macOS Keychain services for its OAuth credential.
+/// Claude Code keeps that credential outside `~/.claude`; exposing only the
+/// state directory leaves it looking logged out. These services are limited
+/// to normal Claude agent-state launches.
+fn push_claude_keychain_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || !config.agent_state_enabled()
+        || crate::command::effective_name(&config.command) != Some("claude")
+    {
+        return;
+    }
+
+    profile.push_str(
+        "; Claude Code OAuth credential lookup through macOS Keychain\n\
+         (allow mach-lookup (global-name \"com.apple.securityd.xpc\"))\n\
+         (allow mach-lookup (global-name \"com.apple.SecurityServer\"))\n",
+    );
 }
 
 /// Emit an allow/deny rule for a single host path. Uses `subpath` if
@@ -613,6 +734,105 @@ fn push_network_section(
         }
         _ => {}
     }
+    push_forward_ports_section(profile, config);
+}
+
+/// `--forward-port`: Seatbelt shares the host's network stack, so each
+/// forward is one outbound rule naming the port, not a relay.
+fn push_forward_ports_section(profile: &mut String, config: &Config) {
+    let ports = config.forward_ports();
+    if ports.is_empty() {
+        return;
+    }
+    profile.push_str("; Forwarded host loopback ports (--forward-port)\n");
+    for port in ports {
+        profile.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+    }
+    profile.push('\n');
+}
+
+/// Codex 0.16x moved the interactive client onto a persistent app-server
+/// daemon. Its control plane is a Unix socket, so Seatbelt classifies the
+/// connection as `network-outbound` even though no network access is wanted.
+/// Allow only Codex's own control socket when its trusted agent state is
+/// mounted; do not widen the sandbox to arbitrary Unix sockets or TCP. The
+/// daemon creates its socket after the profile is built, so the canonical
+/// target is not always available yet. Its per-user runtime path is stable
+/// even though the socket's hash changes between starts.
+fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || !config.agent_state_enabled()
+        || crate::command::effective_name(&config.command) != Some("codex")
+    {
+        return;
+    }
+
+    let socket = super::home_dir()
+        .join(".codex/app-server-control/app-server-control.sock");
+    // The daemon exposes this as a symlink into its per-user runtime
+    // directory. Seatbelt evaluates the resolved Unix-socket endpoint, so
+    // matching only the symlink path still produces EPERM on connect().
+    let socket = canonicalize_or_keep(&socket);
+    let escaped = sbpl_escape(socket.to_string_lossy().as_ref());
+    profile.push_str("; Codex app-server daemon control socket\n");
+    profile.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+    profile.push_str(&format!(
+        "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))\n\n"
+    ));
+    let uid = unsafe { nix::libc::getuid() };
+    profile.push_str(&format!(
+        "(allow network-outbound (remote unix-socket \
+         (path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")))\n\n"
+    ));
+    profile.push_str(&format!(
+        "(allow network-bind (local unix-socket \
+         (path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")))\n\n"
+    ));
+}
+
+/// Codex's managed app-server initializes macOS account and notification
+/// services before it publishes its control socket. Keep these lookups
+/// limited to Codex launches; neither service is granted to arbitrary tools.
+fn push_codex_mach_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || !config.agent_state_enabled()
+        || crate::command::effective_name(&config.command) != Some("codex")
+    {
+        return;
+    }
+
+    profile.push_str("; Codex app-server system services\n");
+    for service in [
+        "com.apple.cfprefsd.agent",
+        "com.apple.SecurityServer",
+        "com.apple.trustd.agent",
+        "com.apple.SystemConfiguration.configd",
+        "com.apple.system.notification_center",
+        "com.apple.system.opendirectoryd.libinfo",
+    ] {
+        profile.push_str(&format!(
+            "(allow mach-lookup (global-name \"{service}\"))\n"
+        ));
+    }
+    profile.push('\n');
+
+    // CFPreferences uses shared memory for managed and per-user defaults.
+    // Codex 0.162.1 fails account/read when Seatbelt denies these two names.
+    let uid = unsafe { nix::libc::getuid() };
+    for name in [
+        format!("apple.cfprefs.{uid}v1"),
+        "apple.cfprefs.daemonv1".into(),
+    ] {
+        profile.push_str(&format!(
+            "(allow ipc-posix-shm-read-data (ipc-posix-name \"{name}\"))\n"
+        ));
+        profile.push_str(&format!(
+            "(allow ipc-posix-shm-write-data (ipc-posix-name \"{name}\"))\n"
+        ));
+    }
+    profile.push('\n');
 }
 
 fn push_file_read_section(
@@ -772,6 +992,75 @@ fn push_file_write_section(
     }
     for deny_path in deny_paths {
         push_path_rule(profile, "deny", "file-write*", deny_path);
+    }
+    profile.push('\n');
+}
+
+/// Add a write denial for Devin's version tree and mutable `current`
+/// selector. The version tree lives inside the broadly writable Devin data
+/// directory, so an ancestor RW rule alone would permit in-jail upgrades.
+/// The selector is emitted as a raw final path component because resolving
+/// the symlink would only protect the selected version, not replacement of
+/// the selector itself.
+fn devin_installation_write_denies(config: &Config) -> Vec<PathBuf> {
+    if crate::command::effective_name(&config.command) != Some("devin") {
+        return Vec::new();
+    }
+    let Some(versions) = super::devin_installation_dir(config) else {
+        return Vec::new();
+    };
+    let data = versions
+        .parent()
+        .and_then(Path::parent)
+        .expect("Devin data path");
+    let installation = super::devin_installation(data);
+    if config.agent_state_enabled()
+        && data.is_dir()
+        && super::devin_state_paths(config).contains(&data.to_path_buf())
+        && installation == super::DevinInstallation::Invalid
+    {
+        output::warn(&format!(
+            "Devin: cli/_versions is missing, unreadable, or a symlink under {}; writable state sharing skipped",
+            data.display()
+        ));
+    }
+    if installation == super::DevinInstallation::Absent {
+        return Vec::new();
+    }
+    vec![versions.clone(), versions.join("current")]
+}
+
+fn push_write_deny_literal(profile: &mut String, path: &Path) {
+    let node = symlink_node_rule_path(path)
+        .unwrap_or_else(|| canonicalize_or_keep(path));
+    let escaped = sbpl_escape(node.to_string_lossy().as_ref());
+    profile.push_str(&format!("(deny file-write* (literal \"{escaped}\"))\n"));
+}
+
+fn push_devin_installation_write_denies(
+    profile: &mut String,
+    paths: &[PathBuf],
+) {
+    if paths.is_empty() {
+        return;
+    }
+    profile.push_str("; Devin installation stays read-only\n");
+    for path in paths {
+        push_path_rule(profile, "deny", "file-write*", path);
+    }
+    // Pin the launcher ancestor without denying writes to CLI metadata.
+    let cli = paths[0].parent().expect("Devin cli path");
+    push_write_deny_literal(profile, cli);
+    let data = cli.parent().expect("Devin data path");
+    if data.is_dir()
+        && super::devin_installation(data) == super::DevinInstallation::Invalid
+    {
+        push_path_rule(profile, "deny", "file-write*", data);
+    }
+    for node in paths {
+        // Preserve each final component here: canonicalizing a symlink would
+        // only deny writes to its target, leaving the node replaceable.
+        push_write_deny_literal(profile, node);
     }
     profile.push('\n');
 }
@@ -961,10 +1250,42 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         Some("aider") => push(".aider"),
         Some("soulforge") => push(".soulforge"),
         Some("omp") => push(".omp"),
+        // kiro-cli's login lives in its data dir, which on macOS is
+        // Application Support (bwrap mounts ~/.local/share/kiro-cli).
+        Some("kiro-cli") => {
+            push(".kiro");
+            push("Library/Application Support/kiro-cli");
+        }
+        // Mirrors the bwrap-side list: only ~/.prime/agent, never the
+        // whole ~/.prime (the prime compute CLI's API key lives in
+        // the sibling config.json).
+        Some("prime-agent") => push(".prime/agent"),
+        Some("devin") => {
+            let data_root =
+                super::devin_installation_dir(config).and_then(|versions| {
+                    versions.parent()?.parent().map(Path::to_path_buf)
+                });
+            for path in super::devin_state_paths(config) {
+                let is_data = data_root.as_ref() == Some(&path);
+                if is_data
+                    && super::devin_installation(&path)
+                        == super::DevinInstallation::Invalid
+                {
+                    continue;
+                }
+                if super::path_exists(&path) && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
         _ => {}
     }
     paths
 }
+
+// macOS needs no symlink-preservation equivalent of the bwrap command
+// exemption: seatbelt profiles operate on the host filesystem (no bind
+// flattening), so command symlink chains resolve naturally.
 
 fn macos_writable_paths(
     project_dir: &Path,
@@ -1103,6 +1424,16 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // receive write access through macos_writable_paths.
     push_unique(canonicalize_or_keep(project_dir));
 
+    // Codex's ps helper is this executable, reached through a private temp
+    // symlink. Name its canonical target explicitly so Seatbelt can resolve
+    // that symlink without exposing the rest of the installation directory.
+    if !config.lockdown_enabled()
+        && crate::command::effective_name(&config.command) == Some("codex")
+        && let Ok(executable) = std::env::current_exe()
+    {
+        push_unique(canonicalize_or_keep(&executable));
+    }
+
     if let Some(worktree) =
         super::discover_git_worktree_paths(config, project_dir, false)
     {
@@ -1145,6 +1476,20 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // already covered by the compat list below.
     for path in agent_state_paths(config) {
         push_unique(canonicalize_or_keep(&path));
+    }
+
+    // Claude Code's macOS OAuth credential lives in the login Keychain,
+    // outside ~/.claude. Expose only the login database read-only; the
+    // Keychain daemon performs item access and writes through its XPC API.
+    if !config.lockdown_enabled()
+        && config.agent_state_enabled()
+        && crate::command::effective_name(&config.command) == Some("claude")
+    {
+        let keychain_db =
+            super::home_dir().join("Library/Keychains/login.keychain-db");
+        if keychain_db.is_file() {
+            push_unique(canonicalize_or_keep(&keychain_db));
+        }
     }
 
     if !private_home {
@@ -1412,6 +1757,76 @@ mod tests {
     }
 
     #[test]
+    fn claude_agent_state_can_use_macos_keychain_xpc() {
+        // Claude Code keeps macOS OAuth credentials in Keychain rather than
+        // ~/.claude. Agent-state passthrough must therefore include its
+        // specific Keychain XPC service and read-only login database.
+        let fixture = agent_state_fixture_home("claude-keychain");
+        let keychain_dir = fixture.home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychain_dir).unwrap();
+        std::fs::write(keychain_dir.join("login.keychain-db"), b"fixture")
+            .unwrap();
+        let claude = Config {
+            command: vec!["claude".into()],
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&claude, Path::new("/tmp/test-project"));
+        let keychain_db =
+            canonicalize_or_keep(&keychain_dir.join("login.keychain-db"));
+        let keychain_dir = canonicalize_or_keep(&keychain_dir);
+        assert!(
+            profile.contains(
+                "(allow mach-lookup (global-name \"com.apple.securityd.xpc\"))"
+            ),
+            "Claude agent-state must be able to access its macOS Keychain credential"
+        );
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))"
+        ));
+        assert!(profile.contains(&format!(
+            "(allow file-read* (literal \"{}\"))",
+            sbpl_escape(keychain_db.to_string_lossy().as_ref())
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            sbpl_escape(keychain_dir.to_string_lossy().as_ref())
+        )));
+
+        let no_agent_state = Config {
+            agent_state: Some(false),
+            ..claude.clone()
+        };
+        let no_agent_state_profile = generate_sbpl_profile(
+            &no_agent_state,
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!no_agent_state_profile.contains("com.apple.securityd.xpc"));
+        assert!(!no_agent_state_profile.contains("com.apple.SecurityServer"));
+        assert!(!no_agent_state_profile.contains("login.keychain-db"));
+
+        let other_agent = Config {
+            command: vec!["codex".into()],
+            ..claude.clone()
+        };
+        let other_agent_profile =
+            generate_sbpl_profile(&other_agent, Path::new("/tmp/test-project"));
+        assert!(!other_agent_profile.contains("com.apple.securityd.xpc"));
+        assert!(!other_agent_profile.contains("login.keychain-db"));
+
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..claude
+        };
+        let lockdown_profile =
+            generate_sbpl_profile(&lockdown, Path::new("/tmp/test-project"));
+        assert!(!lockdown_profile.contains("com.apple.securityd.xpc"));
+        assert!(!lockdown_profile.contains("com.apple.SecurityServer"));
+        assert!(!lockdown_profile.contains("login.keychain-db"));
+    }
+
+    #[test]
     fn sbpl_network_and_host_ipc_require_explicit_opt_in() {
         let config = Config {
             network: Some(true),
@@ -1432,6 +1847,117 @@ mod tests {
         assert!(profile.contains("(allow ipc-posix-shm-write-create)"));
         assert!(profile.contains("(allow ipc-posix-sem)"));
         assert!(!profile.contains("mach-register"));
+    }
+
+    #[test]
+    fn codex_agent_state_allows_only_its_control_unix_socket() {
+        let fixture = agent_state_fixture_home("codex-daemon-socket");
+        let project = PathBuf::from("/tmp/test-project");
+        let config = Config {
+            command: vec!["codex".into()],
+            no_mise: Some(true),
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let socket = fixture
+            .home
+            .join(".codex/app-server-control/app-server-control.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // Keep the resolved target short enough for Darwin's SUN_LEN limit;
+        // the real daemon likewise uses a short hash under /private/tmp.
+        let daemon_socket = std::env::temp_dir()
+            .join(format!("aj-codex-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&daemon_socket);
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
+        std::os::unix::fs::symlink(&daemon_socket, &socket).unwrap();
+
+        let profile = generate_sbpl_profile(&config, &project);
+        let escaped = sbpl_escape(
+            canonicalize_or_keep(&socket).to_string_lossy().as_ref(),
+        );
+        assert!(profile.contains(&format!(
+            "(allow network-outbound (remote unix-socket \
+             (path-literal \"{escaped}\")))"
+        )));
+        assert!(
+            profile.contains("(allow system-socket (socket-domain AF_UNIX))")
+        );
+        for service in [
+            "com.apple.cfprefsd.agent",
+            "com.apple.SecurityServer",
+            "com.apple.trustd.agent",
+        ] {
+            assert!(profile.contains(service), "missing {service}");
+        }
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.SystemConfiguration.configd\"))"
+        ));
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.system.notification_center\"))"
+        ));
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.system.opendirectoryd.libinfo\"))"
+        ));
+        let uid = unsafe { nix::libc::getuid() };
+        for name in [
+            format!("apple.cfprefs.{uid}v1"),
+            "apple.cfprefs.daemonv1".into(),
+        ] {
+            for operation in
+                ["ipc-posix-shm-read-data", "ipc-posix-shm-write-data"]
+            {
+                assert!(profile.contains(&format!(
+                    "(allow {operation} (ipc-posix-name \"{name}\"))"
+                )));
+            }
+        }
+        assert!(profile.contains(&format!(
+            "(path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")"
+        )));
+        assert!(profile.contains("(allow network-bind (local unix-socket"));
+        assert!(!profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("(allow network-bind)\n"));
+
+        let no_agent_state = Config {
+            agent_state: Some(false),
+            ..config.clone()
+        };
+        let no_agent_state_profile =
+            generate_sbpl_profile(&no_agent_state, &project);
+        assert!(!no_agent_state_profile.contains("com.apple.cfprefsd.agent"));
+        assert!(!no_agent_state_profile.contains("com.apple.trustd.agent"));
+        assert!(!no_agent_state_profile.contains("ipc-posix-shm-read-data"));
+
+        let other_tool = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let other_profile = generate_sbpl_profile(
+            &other_tool,
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(
+            !other_profile.contains("com.apple.system.notification_center")
+        );
+        assert!(
+            !other_profile.contains("com.apple.system.opendirectoryd.libinfo")
+        );
+        assert!(
+            !other_profile.contains("com.apple.SystemConfiguration.configd")
+        );
+        assert!(!other_profile.contains("com.apple.cfprefsd.agent"));
+        assert!(!other_profile.contains("com.apple.SecurityServer"));
+        assert!(!other_profile.contains("com.apple.trustd.agent"));
+        assert!(!other_profile.contains("ipc-posix-shm-read-data"));
+        assert!(!other_profile.contains("ipc-posix-shm-write-data"));
+
+        let _ = std::fs::remove_dir_all(&fixture.home);
+        let _ = std::fs::remove_file(&daemon_socket);
     }
 
     #[test]
@@ -1508,6 +2034,53 @@ mod tests {
     }
 
     #[test]
+    fn sbpl_profile_forward_port_allows_only_that_loopback_port() {
+        let config = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(profile.contains(
+            "(allow network-outbound (remote ip \"localhost:49374\"))"
+        ));
+        // No blanket rule: every other port stays refused.
+        assert!(!profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("network-inbound"));
+        assert!(!profile.contains("network-bind"));
+
+        let without = generate_sbpl_profile(
+            &Config::default(),
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!without.contains("49374"));
+    }
+
+    #[test]
+    fn sbpl_profile_forward_port_composes_with_filtered_egress_and_lockdown() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374, 5432],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        for port in [15919, 49374, 5432] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow network-outbound (remote ip \"localhost:{port}\"))"
+                )),
+                "port {port}"
+            );
+        }
+        assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
     fn build_child_env_filtered_forces_proxy_env() {
         let _env = ENV_LOCK.lock().unwrap();
         let _passed = EnvVarGuard::set("AI_JAIL_TEST_SECRET", "hunter2");
@@ -1530,7 +2103,8 @@ mod tests {
             false,
             None,
             Some(15919),
-        );
+        )
+        .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         let get = |name: &str| {
             env.get(&std::ffi::OsStr::new(name)).copied().flatten()
@@ -1552,6 +2126,38 @@ mod tests {
     }
 
     #[test]
+    fn build_child_env_forward_port_exempts_loopback_from_proxy() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let cmd = build(
+            &config,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            Some(15919),
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let get = |name: &str| {
+            env.get(&std::ffi::OsStr::new(name)).copied().flatten()
+        };
+
+        let loopback = std::ffi::OsStr::new("127.0.0.1,localhost,::1");
+        assert_eq!(get("no_proxy"), Some(loopback));
+        assert_eq!(get("NO_PROXY"), Some(loopback));
+        assert_eq!(
+            get("http_proxy"),
+            Some(std::ffi::OsStr::new("http://127.0.0.1:15919"))
+        );
+    }
+
+    #[test]
     fn build_child_env_non_filtered_has_no_proxy_env() {
         let _env = ENV_LOCK.lock().unwrap();
         let config = Config {
@@ -1560,10 +2166,39 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!env.contains_key(std::ffi::OsStr::new("http_proxy")));
         assert!(!env.contains_key(std::ffi::OsStr::new("ALL_PROXY")));
+    }
+
+    #[test]
+    fn codex_build_prepends_private_ps_helper_to_path() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["codex".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
+        let path = cmd
+            .get_envs()
+            .find(|(key, _)| key == &std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        let mut paths = std::env::split_paths(path);
+        let helper_dir = paths.next().unwrap();
+        assert_eq!(
+            helper_dir.file_name(),
+            Some(std::ffi::OsStr::new("codex-bin"))
+        );
+        assert_eq!(
+            std::fs::read_link(helper_dir.join("ps")).unwrap(),
+            std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
     }
 
     #[test]
@@ -2638,6 +3273,9 @@ mod tests {
             ".aider",
             ".soulforge",
             ".omp",
+            ".kiro",
+            "Library/Application Support/kiro-cli",
+            ".prime/agent",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
@@ -2733,6 +3371,13 @@ mod tests {
             (vec!["aider"], vec![".aider"]),
             (vec!["soulforge"], vec![".soulforge"]),
             (vec!["omp"], vec![".omp"]),
+            (
+                vec!["kiro-cli"],
+                vec![".kiro", "Library/Application Support/kiro-cli"],
+            ),
+            // Only .prime/agent, never the whole ~/.prime: sibling
+            // config.json holds the prime CLI's API key.
+            (vec!["prime-agent"], vec![".prime/agent"]),
         ] {
             let config = Config {
                 command: command
@@ -2785,6 +3430,440 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    struct DevinStateFixture {
+        root: PathBuf,
+        home: PathBuf,
+        data_home: PathBuf,
+        config_home: PathBuf,
+        project_dir: PathBuf,
+        versions_dir: PathBuf,
+        current_selector: PathBuf,
+    }
+
+    impl Drop for DevinStateFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn devin_state_fixture(prefix: &str) -> DevinStateFixture {
+        use std::fs;
+
+        // macOS runners put the temp dir deep under /private/var/folders/…,
+        // and canonicalizing this fixture's root plus the deepest path it
+        // builds (`devin/cli/_versions/…`) can exceed a Unix socket name
+        // (SUN_LEN), which a test below needs for its Docker socket bind.
+        // Pick a short base when the canonical temp root is too long for
+        // the fixture tree.
+        const MAX_ROOT: usize = 60;
+        let make_root = |base: &Path| {
+            base.join(format!("ai-jail-sb-{prefix}-{}", std::process::id()))
+        };
+        let mut root = make_root(&std::env::temp_dir());
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root = fs::canonicalize(&root).unwrap();
+        if root.to_string_lossy().len() > MAX_ROOT {
+            let _ = fs::remove_dir_all(&root);
+            let short = make_root(Path::new("/tmp"));
+            let _ = fs::remove_dir_all(&short);
+            fs::create_dir_all(&short).unwrap();
+            root = fs::canonicalize(&short)
+                .expect("short fixture base must stay within SUN_LEN");
+        }
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let project_dir = root.join("project");
+        let cli_dir = data_home.join("devin/cli");
+        let versions_dir = cli_dir.join("_versions");
+        let version_bin = versions_dir.join("3000.11.3/bin");
+        let current_selector = versions_dir.join("current");
+
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&version_bin).unwrap();
+        fs::create_dir_all(config_home.join("devin")).unwrap();
+        fs::write(config_home.join("devin/config.json"), "{}\n").unwrap();
+        fs::write(version_bin.join("devin"), "fixture executable\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("3000.11.3", &current_selector).unwrap();
+
+        DevinStateFixture {
+            root,
+            home,
+            data_home,
+            config_home,
+            project_dir,
+            versions_dir,
+            current_selector,
+        }
+    }
+
+    #[test]
+    fn devin_state_is_rw_but_installation_tree_and_selector_are_write_denied() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("state-profile");
+        let _home = EnvVarGuard::set("HOME", fixture.home.as_os_str());
+        let _data =
+            EnvVarGuard::set("XDG_DATA_HOME", fixture.data_home.as_os_str());
+        let _config = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            fixture.config_home.as_os_str(),
+        );
+        let docker_socket = fixture.root.join("docker.sock");
+        let _docker_listener =
+            std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
+        let _docker_host = EnvVarGuard::set(
+            "DOCKER_HOST",
+            format!("unix://{}", docker_socket.display()),
+        );
+
+        let data_state = fixture.data_home.join("devin");
+        let config_state = fixture.config_home.join("devin");
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            no_docker: Some(false),
+            ..Config::default()
+        };
+        let expected = vec![data_state.clone(), config_state.clone()];
+        assert_eq!(agent_state_paths(&config), expected);
+
+        let writable =
+            macos_writable_paths(&fixture.project_dir, &config, false);
+        assert!(writable.contains(&data_state));
+        assert!(writable.contains(&config_state));
+
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data_state = sbpl_path(&data_state);
+        let config_state = sbpl_path(&config_state);
+        let versions = sbpl_path(&fixture.versions_dir);
+        let cli = sbpl_path(fixture.versions_dir.parent().unwrap());
+        assert!(
+            profile
+                .contains(&format!("(deny file-write* (literal \"{cli}\"))"))
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{data_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{data_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{config_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{config_state}\"))"
+        )));
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{versions}\"))"
+            ))
+        );
+
+        let current_node =
+            symlink_node_rule_path(&fixture.current_selector).unwrap();
+        let current_node = sbpl_escape(current_node.to_string_lossy().as_ref());
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{current_node}\"))"
+        )));
+        let state_write = profile
+            .find(&format!("(allow file-write* (subpath \"{data_state}\"))"))
+            .unwrap();
+        let versions_deny = profile
+            .find(&format!("(deny file-write* (subpath \"{versions}\"))"))
+            .unwrap();
+        let docker_allow = profile
+            .find(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                sbpl_path(&docker_socket)
+            ))
+            .unwrap();
+        let current_deny = profile
+            .find(&format!("(deny file-write* (literal \"{current_node}\"))"))
+            .unwrap();
+        assert!(state_write < versions_deny);
+        assert!(docker_allow < versions_deny);
+        assert!(versions_deny < current_deny);
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read* (subpath \"{versions}\"))"
+            )),
+            "the version tree stays readable for execution"
+        );
+
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[test]
+    fn devin_incomplete_and_symlink_installations_skip_writable_data() {
+        let _env = ENV_LOCK.lock().unwrap();
+        for layout in ["missing-versions", "symlink-cli"] {
+            let fixture = devin_state_fixture(layout);
+            let _home = EnvVarGuard::set("HOME", &fixture.home);
+            let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+            let _config =
+                EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+            let cli = fixture.versions_dir.parent().unwrap();
+            match layout {
+                "missing-versions" => {
+                    std::fs::remove_dir_all(&fixture.versions_dir).unwrap()
+                }
+                _ => {
+                    let target = fixture.root.join("external-cli");
+                    std::fs::rename(cli, &target).unwrap();
+                    std::os::unix::fs::symlink(target, cli).unwrap();
+                }
+            }
+            let config = Config {
+                command: vec!["devin".into()],
+                no_mise: Some(true),
+                ..Config::default()
+            };
+            assert_eq!(
+                agent_state_paths(&config),
+                vec![fixture.config_home.join("devin")]
+            );
+            let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+            assert!(profile.contains(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                sbpl_path(&fixture.data_home.join("devin"))
+            )));
+        }
+    }
+
+    #[test]
+    fn devin_external_installation_shares_state_without_installation_denies() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("external-installation");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        std::fs::remove_dir_all(fixture.versions_dir.parent().unwrap())
+            .unwrap();
+        let data = fixture.data_home.join("devin");
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(
+            agent_state_paths(&config),
+            vec![data.clone(), fixture.config_home.join("devin")]
+        );
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data_rule = sbpl_path(&data);
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{data_rule}\"))"
+        )));
+        assert!(!profile.contains(&format!(
+            "(deny file-write* (subpath \"{data_rule}\"))"
+        )));
+        assert!(devin_installation_write_denies(&config).is_empty());
+        assert!(!data.join("cli").exists());
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            eprintln!(
+                "SKIPPED: sandbox-exec unavailable for external installation runtime probe"
+            );
+            return;
+        }
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/bin/sh", "-c",
+                "set -eu; printf rotated > \"$1/credentials.tmp\"; /bin/mv \"$1/credentials.tmp\" \"$1/credentials.toml\"; /bin/mkdir -p \"$1/history\"; printf session > \"$1/history/session.log\"",
+                "probe"])
+            .arg(&data).output().expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("credentials.toml")).unwrap(),
+            "rotated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("history/session.log")).unwrap(),
+            "session"
+        );
+        assert!(!data.join("cli").exists());
+    }
+
+    #[test]
+    fn devin_current_target_outside_versions_remains_write_denied() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("external-current");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        let target = fixture.project_dir.join("external-version");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::remove_file(&fixture.current_selector).unwrap();
+        std::os::unix::fs::symlink(&target, &fixture.current_selector).unwrap();
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            sbpl_path(&target)
+        )));
+        let current =
+            symlink_node_rule_path(&fixture.current_selector).unwrap();
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{}\"))",
+            sbpl_escape(current.to_string_lossy().as_ref())
+        )));
+    }
+
+    #[test]
+    fn devin_runtime_blocks_cli_rename_and_preserves_metadata_writes() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("runtime-installation");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data = fixture.data_home.join("devin");
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/bin/sh", "-c",
+                "set -eu; if /bin/mv \"$1/cli\" \"$1/cli.moved\" 2>/dev/null; then exit 10; fi; printf metadata > \"$1/cli/installation_id\"; if printf tampered > \"$1/cli/_versions/3000.11.3/bin/devin\" 2>/dev/null; then exit 11; fi; printf credential > \"$1/credentials.tmp\"; /bin/mv \"$1/credentials.tmp\" \"$1/credentials.toml\"",
+                "probe"])
+            .arg(&data).output().expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!data.join("cli.moved").exists());
+        assert_eq!(
+            std::fs::read_to_string(data.join("cli/installation_id")).unwrap(),
+            "metadata"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                fixture.versions_dir.join("3000.11.3/bin/devin")
+            )
+            .unwrap(),
+            "fixture executable\n"
+        );
+    }
+
+    #[test]
+    fn devin_state_keeps_masks_hides_and_optouts_in_force() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("state-policy");
+        let _home = EnvVarGuard::set("HOME", fixture.home.as_os_str());
+        let _data =
+            EnvVarGuard::set("XDG_DATA_HOME", fixture.data_home.as_os_str());
+        let _config = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            fixture.config_home.as_os_str(),
+        );
+
+        let data_state = fixture.data_home.join("devin");
+        let config_state = fixture.config_home.join("devin");
+        let project = &fixture.project_dir;
+        let base = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+
+        let explicitly_denied = Config {
+            mask: vec![data_state.clone()],
+            deny_paths: vec![config_state.clone()],
+            ..base.clone()
+        };
+        let profile = generate_sbpl_profile(&explicitly_denied, project);
+        for state in [&data_state, &config_state] {
+            let state = sbpl_path(state);
+            assert!(
+                profile.contains(&format!(
+                    "(deny file-read* (subpath \"{state}\"))"
+                ))
+            );
+            assert!(profile.contains(&format!(
+                "(deny file-write* (subpath \"{state}\"))"
+            )));
+        }
+
+        // The logical defaults remain hideable even when Devin's selected
+        // XDG roots are custom paths outside HOME.
+        let hidden_data = Config {
+            hide_dotdirs: vec![".local".into()],
+            ..base.clone()
+        };
+        assert_eq!(agent_state_paths(&hidden_data), vec![config_state.clone()]);
+        let hidden_config = Config {
+            hide_dotdirs: vec![".config".into()],
+            ..base.clone()
+        };
+        assert_eq!(agent_state_paths(&hidden_config), vec![data_state.clone()]);
+
+        let opted_out = Config {
+            agent_state: Some(false),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&opted_out).is_empty());
+        let browser = Config {
+            browser_profile: Some("soft".into()),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&browser).is_empty());
+        let locked = Config {
+            lockdown: Some(true),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&locked).is_empty());
+
+        // A broad --no-private-home grant includes the default Devin data
+        // root. The specific install deny must still follow that broad RW
+        // rule, including when XDG overrides are absent.
+        let default_data = fixture.home.join(".local/share/devin");
+        let default_config = fixture.home.join(".config/devin");
+        let default_versions = default_data.join("cli/_versions");
+        std::fs::create_dir_all(default_versions.join("3000.11.3/bin"))
+            .unwrap();
+        std::fs::create_dir_all(&default_config).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "3000.11.3",
+            default_versions.join("current"),
+        )
+        .unwrap();
+        let _unset_data = EnvVarGuard::remove("XDG_DATA_HOME");
+        let _unset_config = EnvVarGuard::remove("XDG_CONFIG_HOME");
+        let broad_home = Config {
+            private_home: Some(false),
+            ..base
+        };
+        let profile = generate_sbpl_profile(&broad_home, project);
+        let local = sbpl_path(&fixture.home.join(".local"));
+        let versions = sbpl_path(&default_versions);
+        let broad_write = profile
+            .find(&format!("(allow file-write* (subpath \"{local}\"))"))
+            .unwrap();
+        let versions_deny = profile
+            .find(&format!("(deny file-write* (subpath \"{versions}\"))"))
+            .unwrap();
+        assert!(broad_write < versions_deny);
+
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
     #[test]
     fn writable_paths_use_dedicated_session_tmpdir() {
         let Some(root) = validated_macos_tmpdir() else {
@@ -2818,7 +3897,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let session = root.join(format!("ai-jail-{}", std::process::id()));
         let tmpdir = cmd
             .get_envs()
@@ -2845,7 +3925,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
 
         let get = |name: &str| {
@@ -2875,6 +3956,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_agent_state_passes_user_for_keychain_lookup() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _user = EnvVarGuard::set("USER", "ai-jail-test-user");
+        let config = Config {
+            command: vec!["claude".into()],
+            agent_state: Some(true),
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            env.get(&std::ffi::OsStr::new("USER")).copied().flatten(),
+            Some(std::ffi::OsStr::new("ai-jail-test-user"))
+        );
+
+        let other_agent = Config {
+            command: vec!["codex".into()],
+            ..config.clone()
+        };
+        let cmd = build(
+            &other_agent,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert!(!env.contains_key(&std::ffi::OsStr::new("USER")));
+    }
+
+    #[test]
     fn inherit_env_opt_in_passes_host_environment() {
         let _env = ENV_LOCK.lock().unwrap();
         let _state = EnvVarGuard::set("AI_JAIL_HOST_STATE", "secret");
@@ -2886,7 +4002,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             env.get(&std::ffi::OsStr::new("AI_JAIL_HOST_STATE"))

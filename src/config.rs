@@ -274,6 +274,18 @@ pub struct Config {
     /// this list, never grow it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_hosts: Vec<String>,
+    /// Hosts whose explicit trusted grant may resolve to RFC1918/ULA or
+    /// carrier-grade NAT addresses. Loopback, link-local, multicast,
+    /// unspecified, and cloud-metadata addresses remain denied. This is a
+    /// trusted capability: an untrusted project may not add entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_private_hosts: Vec<String>,
+    /// Host loopback ports exposed on the sandbox's own loopback (Linux).
+    /// Each is relayed through a Unix socket, so the private netns stays
+    /// in place and only the named port crosses it. Trusted capability:
+    /// the untrusted project `.ai-jail` may only shrink this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -486,20 +498,33 @@ impl Config {
     pub fn allow_hosts(&self) -> &[String] {
         &self.allow_hosts
     }
+    pub fn allow_private_hosts(&self) -> &[String] {
+        &self.allow_private_hosts
+    }
+    pub fn host_is_allowlisted(&self, host: &str) -> bool {
+        crate::proxy::allowlist_matches(&self.allow_hosts, host)
+            || crate::proxy::allowlist_matches(&self.allow_private_hosts, host)
+    }
+    pub fn has_filtered_hosts(&self) -> bool {
+        !self.allow_hosts.is_empty() || !self.allow_private_hosts.is_empty()
+    }
+    pub fn forward_ports(&self) -> &[u16] {
+        &self.forward_ports
+    }
     /// Effective network posture: `network = true` wins as unrestricted,
-    /// a non-empty `allow_hosts` selects filtered egress through the
+    /// a non-empty filtered host list selects filtered egress through the
     /// CONNECT proxy, otherwise networking stays off. The
-    /// Full-plus-allow_hosts contradiction is a launch error, checked in
+    /// Full-plus-filtered-hosts contradiction is a launch error, checked in
     /// main (`validate_network_flags`).
     pub fn network_mode(&self) -> NetworkMode {
         if self.network_enabled() {
             NetworkMode::Full
-        } else if !self.allow_hosts.is_empty() {
-            // `--no-network` (network == Some(false)) with allow_hosts is NOT
+        } else if self.has_filtered_hosts() {
+            // `--no-network` (network == Some(false)) with filtered hosts is NOT
             // a contradiction: it composes to filtered egress, and the
             // landlock wrapper itself re-execs with `--no-network` +
             // `--allow-host` to express exactly this (see bwrap.rs). Strict
-            // offline is `--no-network` with no allow_hosts.
+            // offline is `--no-network` with no filtered hosts.
             NetworkMode::Filtered
         } else {
             NetworkMode::Off
@@ -1118,6 +1143,11 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     // Trusted layers union the filtered-egress allowlist.
     c.allow_hosts.extend(local.allow_hosts);
     dedup_strings(&mut c.allow_hosts);
+    c.allow_private_hosts.extend(local.allow_private_hosts);
+    dedup_strings(&mut c.allow_private_hosts);
+    c.forward_ports.extend(local.forward_ports);
+    c.forward_ports.sort_unstable();
+    c.forward_ports.dedup();
     take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
@@ -1524,6 +1554,34 @@ pub fn merge_with_global_report(
             dropped_hosts.join(", ")
         ));
     }
+    let dropped_private_hosts: Vec<_> = local
+        .allow_private_hosts
+        .into_iter()
+        .filter(|host| !c.allow_private_hosts.contains(host))
+        .collect();
+    if !dropped_private_hosts.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail allow_private_hosts ignored: {}",
+            dropped_private_hosts.join(", ")
+        ));
+    }
+    // Port forwarding is shrink-only from an untrusted project, like
+    // allow_hosts: a project cannot open a path to a host service.
+    let dropped_forwards: Vec<_> = local
+        .forward_ports
+        .into_iter()
+        .filter(|port| !c.forward_ports.contains(port))
+        .collect();
+    if !dropped_forwards.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail forward_ports ignored: {}",
+            dropped_forwards
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if local.claude_dir.is_some() {
         warnings.push("project .ai-jail claude_dir ignored (set it in global config or --claude-dir)".into());
     }
@@ -1551,14 +1609,24 @@ pub fn save(config: &Config) {
 /// `.ai-jail` behind (issue #103). `--init` still writes that file, because
 /// there the user explicitly asked for one to edit.
 ///
-/// Fork divergence: a config whose only content is the remembered
-/// `command` also writes nothing when no `.ai-jail` exists yet — a plain
-/// `ai-jail pi` in every repo should not litter project roots with
-/// near-empty files. An existing file is still updated (the user opted in
-/// by having one), so bare `ai-jail` keeps re-running the remembered
-/// command where a config is already present.
-pub fn save_auto(config: &Config) {
-    save_project(config, false);
+/// An untrusted project file keeps only what its next load would accept,
+/// so a capability passed once on the CLI is not saved into a file that
+/// then ignores it, with a warning, on every later run. A project listed
+/// in the global `trust_project_config` is saved as is.
+pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
+    if project_trusted {
+        save_project(config, false);
+    } else {
+        save_project(&untrusted_project_view(config, project_dir), false);
+    }
+}
+
+/// What an untrusted project `.ai-jail` keeps once loaded: the project
+/// layer of [`merge_with_global_report`] over a default baseline. Using the
+/// merge itself keeps auto-save and loading from drifting apart when a
+/// capability is added.
+fn untrusted_project_view(config: &Config, project_dir: &Path) -> Config {
+    merge_with_global_report(Config::default(), config.clone(), project_dir).0
 }
 
 fn save_project(config: &Config, write_when_empty: bool) {
@@ -1579,11 +1647,12 @@ fn save_project(config: &Config, write_when_empty: bool) {
         if config_body_is_empty(&local) {
             return;
         }
-        // Fork divergence (see save_auto): a command-only config does not
-        // create a new .ai-jail; it only updates one that already exists.
+        // FORK: command-only config should only update an existing file;
+        // it should not create a project file just to remember the command.
         if config_body_is_command_only(&local) && !config_path().exists() {
             return;
         }
+        // END FORK
     }
     save_to_path(&config_path(), &local);
 }
@@ -1989,6 +2058,17 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.allow_hosts.extend(cli.allow_hosts.iter().cloned());
     dedup_strings(&mut config.allow_hosts);
 
+    config
+        .allow_private_hosts
+        .extend(cli.allow_private_hosts.iter().cloned());
+    dedup_strings(&mut config.allow_private_hosts);
+
+    config
+        .forward_ports
+        .extend(cli.forward_ports.iter().copied());
+    config.forward_ports.sort_unstable();
+    config.forward_ports.dedup();
+
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
@@ -2058,8 +2138,18 @@ pub fn project_config_for_init(
     invocation_cwd: &Path,
 ) -> Config {
     let mut to_save = merge(cli, project);
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
+}
+
+/// Fields a project file must not carry even when the CLI set them.
+/// These fields are trusted-only. Written into the untrusted project file,
+/// they could never take effect and would only warn on every launch. Forwarded
+/// ports also tend to change from one launch to the next.
+fn drop_launch_only_fields(to_save: &mut Config) {
+    to_save.forward_ports.clear();
+    to_save.allow_private_hosts.clear();
 }
 
 pub fn project_config_for_auto_save(
@@ -2077,6 +2167,7 @@ pub fn project_config_for_auto_save(
         to_save.command = stored_project_command;
     }
 
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
 }
@@ -2277,13 +2368,26 @@ fn print_network_mode(config: &Config) {
     let v = match config.network_mode() {
         NetworkMode::Full => "enabled".to_string(),
         NetworkMode::Filtered => {
-            format!("filtered ({} hosts)", config.allow_hosts.len())
+            format!(
+                "filtered ({} hosts)",
+                config.allow_hosts.len() + config.allow_private_hosts.len()
+            )
         }
         NetworkMode::Off => "disabled".to_string(),
     };
     output::status_header("  Network", &v);
     if config.network_mode() == NetworkMode::Filtered {
         print_string_list("  Allow hosts", &config.allow_hosts);
+        print_string_list("  Allow private hosts", &config.allow_private_hosts);
+    }
+    if !config.forward_ports.is_empty() {
+        let joined = config
+            .forward_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output::status_header("  Forward ports", &joined);
     }
 }
 
@@ -3692,6 +3796,8 @@ no_gpu = true
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             allow_hosts: vec!["api.anthropic.com".into()],
+            allow_private_hosts: vec!["git.internal.example".into()],
+            forward_ports: vec![49374],
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
@@ -3738,6 +3844,11 @@ no_gpu = true
         assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.allow_hosts, config.allow_hosts);
+        assert_eq!(
+            deserialized.allow_private_hosts,
+            config.allow_private_hosts
+        );
+        assert_eq!(deserialized.forward_ports, config.forward_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -4306,6 +4417,78 @@ tailscale = true
     }
 
     #[test]
+    fn untrusted_auto_save_drops_what_the_project_merge_refuses() {
+        // Everything one CLI run can put into the project file that the
+        // untrusted merge refuses on the next load, beside values it keeps.
+        let to_save = Config {
+            command: vec!["claude".into()],
+            network: Some(false),
+            mask: vec![PathBuf::from("/project/.env")],
+            ro_maps: vec![
+                PathBuf::from("/project/docs"),
+                PathBuf::from("/etc/hostname"),
+            ],
+            no_gpu: Some(false),
+            no_display: Some(false),
+            x11: Some(true),
+            ssh: Some(true),
+            pictures: Some(true),
+            github: Some(true),
+            private_home: Some(false),
+            inherit_env: Some(true),
+            claude_dir: Some(PathBuf::from("/tmp/cd")),
+            mask_exceptions: vec![PathBuf::from("/project/.env")],
+            ..Config::default()
+        };
+        let saved = untrusted_project_view(&to_save, Path::new("/project"));
+
+        assert_eq!(saved.command, vec!["claude"]);
+        assert_eq!(saved.network, Some(false));
+        assert_eq!(saved.mask, vec![PathBuf::from("/project/.env")]);
+        assert_eq!(saved.ro_maps, vec![PathBuf::from("/project/docs")]);
+        assert_eq!(saved.no_gpu, None);
+        assert_eq!(saved.no_display, None);
+        assert_eq!(saved.x11, None);
+        assert_eq!(saved.ssh, None);
+        assert_eq!(saved.pictures, None);
+        assert_eq!(saved.github, None);
+        assert_eq!(saved.private_home, None);
+        assert_eq!(saved.inherit_env, None);
+        assert_eq!(saved.claude_dir, None);
+        assert!(saved.mask_exceptions.is_empty());
+
+        // The file auto-save writes loads again without a single warning.
+        let (_, warnings) = merge_with_global_report(
+            Config::default(),
+            saved,
+            Path::new("/project"),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn untrusted_auto_save_keeps_tightening_values() {
+        let to_save = Config {
+            no_gpu: Some(true),
+            lockdown: Some(true),
+            no_toolchains: Some(true),
+            no_save_config: Some(true),
+            hide_dotdirs: vec![".aws".into()],
+            deny_paths: vec![PathBuf::from("/project/secrets")],
+            rw_maps: vec![PathBuf::from("/project/out")],
+            ..Config::default()
+        };
+        let saved = untrusted_project_view(&to_save, Path::new("/project"));
+        assert_eq!(saved.no_gpu, Some(true));
+        assert_eq!(saved.lockdown, Some(true));
+        assert_eq!(saved.no_toolchains, Some(true));
+        assert_eq!(saved.no_save_config, Some(true));
+        assert_eq!(saved.hide_dotdirs, vec![".aws"]);
+        assert_eq!(saved.deny_paths, vec![PathBuf::from("/project/secrets")]);
+        assert_eq!(saved.rw_maps, vec![PathBuf::from("/project/out")]);
+    }
+
+    #[test]
     fn command_scoped_global_applies_for_cli_command() {
         let global = parse_global_toml(
             r#"
@@ -4653,6 +4836,21 @@ allow_hosts = ["api.anthropic.com", "github.com"]
     }
 
     #[test]
+    fn parse_config_with_allow_private_hosts() {
+        let cfg = parse_toml(
+            r#"allow_private_hosts = ["git.internal.example", "registry.internal.example"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.allow_private_hosts,
+            vec![
+                "git.internal.example".to_string(),
+                "registry.internal.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn regression_v1_22_0_config_without_allow_hosts() {
         // Configs written before allow_hosts existed must still parse,
         // defaulting to an empty list (network mode unchanged).
@@ -4674,6 +4872,7 @@ allow_tcp_ports = []
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert!(cfg.allow_hosts.is_empty());
+        assert!(cfg.allow_private_hosts.is_empty());
         assert_eq!(cfg.network_mode(), NetworkMode::Off);
     }
 
@@ -4683,6 +4882,14 @@ allow_tcp_ports = []
         assert_eq!(
             Config {
                 allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Filtered
+        );
+        assert_eq!(
+            Config {
+                allow_private_hosts: vec!["git.internal.example".into()],
                 ..Config::default()
             }
             .network_mode(),
@@ -4749,6 +4956,57 @@ allow_tcp_ports = []
     }
 
     #[test]
+    fn merge_allow_private_hosts_from_trusted_layers() {
+        let existing = Config {
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            allow_private_hosts: vec![
+                "registry.internal.example".into(),
+                "git.internal.example".into(),
+            ],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.allow_private_hosts,
+            vec![
+                "git.internal.example".to_string(),
+                "registry.internal.example".to_string()
+            ]
+        );
+
+        let trusted = merge_with_global(
+            merged,
+            Config {
+                allow_private_hosts: vec!["ci.internal.example".into()],
+                ..Config::default()
+            },
+        );
+        assert_eq!(trusted.allow_private_hosts.len(), 3);
+        assert!(trusted.host_is_allowlisted("build.ci.internal.example"));
+    }
+
+    #[test]
+    fn project_allow_private_hosts_cannot_grant_access() {
+        let project = Config {
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.allow_private_hosts.is_empty());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("allow_private_hosts")
+                && warning.contains("git.internal.example")
+        }));
+    }
+
+    #[test]
     fn merge_allow_hosts_trusted_union() {
         let global = Config {
             allow_hosts: vec!["api.anthropic.com".into()],
@@ -4802,6 +5060,106 @@ allow_tcp_ports = []
             warnings
                 .iter()
                 .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
+        );
+    }
+
+    #[test]
+    fn regression_v2_2_0_config_without_forward_ports() {
+        // Configs written before forward_ports existed must still parse,
+        // with no port forwarded.
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com"]
+rw_maps = []
+ro_maps = []
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.forward_ports().is_empty());
+        // And an empty list is never written back.
+        assert!(!toml::to_string(&config).unwrap().contains("forward_ports"));
+    }
+
+    #[test]
+    fn project_forward_ports_cannot_extend_baseline() {
+        let baseline = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let project = Config {
+            forward_ports: vec![49374, 5432],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(merged.forward_ports, vec![49374]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("forward_ports") && w.contains("5432"))
+        );
+    }
+
+    #[test]
+    fn trusted_launch_only_network_grants_are_never_saved_into_the_project() {
+        let cli = CliArgs {
+            forward_ports: vec![49374],
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..CliArgs::default()
+        };
+        let project = Config {
+            forward_ports: vec![5432],
+            allow_private_hosts: vec!["registry.internal.example".into()],
+            ..Config::default()
+        };
+        let auto = project_config_for_auto_save(
+            &cli,
+            project.clone(),
+            Path::new("/project"),
+        );
+        assert!(auto.forward_ports.is_empty());
+        assert!(auto.allow_private_hosts.is_empty());
+        let init =
+            project_config_for_init(&cli, project, Path::new("/project"));
+        assert!(init.forward_ports.is_empty());
+        assert!(init.allow_private_hosts.is_empty());
+    }
+
+    #[test]
+    fn project_forward_ports_alone_grant_nothing() {
+        let project = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.forward_ports.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("forward_ports")));
+    }
+
+    #[test]
+    fn trusted_layers_and_cli_union_forward_ports() {
+        let global = Config {
+            forward_ports: vec![64342, 49374],
+            ..Config::default()
+        };
+        let trusted = merge_with_global(
+            global,
+            Config {
+                forward_ports: vec![49374, 8080],
+                ..Config::default()
+            },
+        );
+        assert_eq!(trusted.forward_ports, vec![8080, 49374, 64342]);
+        let cli = CliArgs {
+            forward_ports: vec![5173, 8080],
+            ..CliArgs::default()
+        };
+        assert_eq!(
+            merge(&cli, trusted).forward_ports,
+            vec![5173, 8080, 49374, 64342]
         );
     }
 
@@ -5329,6 +5687,42 @@ env_from_file = ["/run/secrets/anthropic"]
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert!(cfg.secret_hosts.is_empty());
+    }
+
+    #[test]
+    fn regression_v2_8_1_auto_saved_capability_opt_ins_parse() {
+        // 2.8.1 auto-save wrote CLI capability opt-ins into the project
+        // file (`--pictures`, `--display`, `--claude-dir`, a map outside the
+        // project). Those files must keep parsing, and the untrusted merge
+        // keeps ignoring the opt-ins with a warning.
+        let toml = r#"
+command = ["true"]
+network = false
+pictures = true
+no_display = false
+claude_dir = "/tmp/cd"
+ro_maps = ["/etc/hostname"]
+mask = ["/project/.env"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.pictures, Some(true));
+        assert_eq!(cfg.no_display, Some(false));
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            cfg,
+            Path::new("/project"),
+        );
+        assert!(!merged.pictures_enabled());
+        assert!(!merged.display_enabled());
+        assert_eq!(merged.claude_dir, None);
+        assert!(merged.ro_maps.is_empty());
+        assert_eq!(merged.mask, vec![PathBuf::from("/project/.env")]);
+        for field in ["pictures", "no_display", "claude_dir", "/etc/hostname"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -6293,10 +6687,14 @@ network = true
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
-        save_auto(&Config {
-            command: vec!["pi".into()],
-            ..Config::default()
-        });
+        save_auto(
+            &Config {
+                command: vec!["pi".into()],
+                ..Config::default()
+            },
+            false,
+            &dir,
+        );
         assert!(!dir.join(".ai-jail").exists());
 
         // An existing file is still updated, so bare `ai-jail` keeps
@@ -6306,10 +6704,14 @@ network = true
             ..Config::default()
         });
         assert!(dir.join(".ai-jail").exists());
-        save_auto(&Config {
-            command: vec!["claude".into()],
-            ..Config::default()
-        });
+        save_auto(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            false,
+            &dir,
+        );
         let on_disk = std::fs::read_to_string(dir.join(".ai-jail")).unwrap();
         assert!(on_disk.contains("claude"), "got:\n{on_disk}");
 
@@ -6329,11 +6731,15 @@ network = true
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
-        save_auto(&Config {
-            command: vec!["pi".into()],
-            no_gpu: Some(true),
-            ..Config::default()
-        });
+        save_auto(
+            &Config {
+                command: vec!["pi".into()],
+                no_gpu: Some(true),
+                ..Config::default()
+            },
+            false,
+            &dir,
+        );
         assert!(dir.join(".ai-jail").exists());
         let on_disk = std::fs::read_to_string(dir.join(".ai-jail")).unwrap();
         assert!(on_disk.contains("no_gpu"), "got:\n{on_disk}");
@@ -6535,6 +6941,8 @@ hide_dotdirs = [".my_secrets"]
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             allow_hosts: vec![],
+            allow_private_hosts: vec![],
+            forward_ports: vec![],
             claude_dir: None,
             agent_state: None,
             inherit_env: None,
