@@ -18,12 +18,12 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::Arc;
 
 mod common;
 
-use common::{SANDBOX_RUN_LOCK, ai_jail};
+use common::{SANDBOX_RUN_LOCK, isolated_ai_jail};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -102,7 +102,7 @@ const REAL: &str = "sk-real-test-value";
 /// `bash -c <script>` inside it.
 fn phantom_run(fixture: u16, lockdown: bool, script: &str) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    let mut command = Command::new(ai_jail());
+    let (mut command, _home) = isolated_ai_jail();
     command.args([
         "--clean",
         "--no-status-bar",
@@ -239,9 +239,9 @@ fn phantom_duplicate_env_entries_do_not_leak_real_value() {
         "true",
     ]];
     for args in cases {
-        let output = Command::new(ai_jail())
+        let (mut command, _home) = isolated_ai_jail();
+        let output = command
             .args(*args)
-            .env("HOME", std::env::temp_dir())
             .output()
             .expect("failed to spawn ai-jail");
         let combined = format!(
@@ -314,7 +314,8 @@ fn phantom_secret_validation_hard_errors() {
         ),
     ];
     for (args, needle) in cases {
-        let output = Command::new(ai_jail())
+        let (mut command, _home) = isolated_ai_jail();
+        let output = command
             .args(*args)
             .output()
             .expect("failed to spawn ai-jail");

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{SANDBOX_RUN_LOCK, ai_jail, http_fixture};
+use common::{SANDBOX_RUN_LOCK, http_fixture, isolated_ai_jail};
 
 /// Run `bash -c <script>` inside a filtered-egress sandbox.
 fn filtered_run(
@@ -53,7 +53,7 @@ fn filtered_run_holding_lock(
     script: &str,
     lockdown: bool,
 ) -> Output {
-    let mut command = Command::new(ai_jail());
+    let (mut command, _home) = isolated_ai_jail();
     command.args(["--clean", "--no-status-bar", "--exec"]);
     if lockdown {
         command.arg("--lockdown");
@@ -206,7 +206,8 @@ fn filtered_egress_forced_env_wins_over_user_env() {
     assert!(stdout.contains("HTTP_PROXY_SEEN=http://127.0.0.1:15919"));
 
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    let output = Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    let output = command
         .args([
             "--clean",
             "--no-status-bar",

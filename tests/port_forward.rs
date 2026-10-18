@@ -13,7 +13,8 @@ use std::process::Command;
 mod common;
 
 use common::{
-    CURL_OPTS, SANDBOX_RUN_LOCK, ai_jail, assert_ok, curl, http_fixture, run_in,
+    CURL_OPTS, SANDBOX_RUN_LOCK, assert_ok, curl, http_fixture,
+    isolated_ai_jail, run_in,
 };
 
 #[test]
@@ -207,7 +208,8 @@ fn simultaneous_relays_are_capped_on_the_host() {
     );
     let port_text = port.to_string();
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    let output = Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    let output = command
         .args(["--clean", "--no-status-bar", "--exec", "--no-save-config"])
         .args(["--forward-port", &port_text])
         .args(["python3", "-c", &script])

@@ -6425,7 +6425,10 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
         // The project directory is mounted read-write, so a target inside
         // it could be rewritten by the agent the policy constrains. Tests
         // run with the crate root as the working directory, so a file
-        // created here is inside the "project" for this check.
+        // created here is inside the "project" for this check. Hold
+        // CWD_LOCK: this test reads current_dir(), so a concurrent
+        // set_current_dir test would relocate (and delete) its probe.
+        let _cwd = CWD_LOCK.lock().unwrap();
         let target = std::env::current_dir()
             .unwrap()
             .join(format!(".ai-jail-symlink-probe-{}", std::process::id()));

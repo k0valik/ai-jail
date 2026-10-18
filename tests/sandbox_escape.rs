@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 mod common;
 
-use common::{SANDBOX_RUN_LOCK, ai_jail};
+use common::{SANDBOX_RUN_LOCK, isolated_ai_jail};
 
 static COMPILE_HELPER: OnceLock<bool> = OnceLock::new();
 
@@ -83,7 +83,8 @@ macro_rules! require_helper {
 /// Run a command inside the sandbox (normal mode).
 fn sandbox_run(args: &[&str]) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    command
         .args([
             "--clean",
             "--no-ssh",
@@ -102,7 +103,8 @@ fn bwrap_supervisor_does_not_retain_host_environment() {
     require_bwrap!();
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     let marker = format!("ai-jail-host-only-{}", std::process::id());
-    let output = Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    let output = command
         .env("AI_JAIL_HOST_ONLY_SENTINEL", &marker)
         .args([
             "--clean",
@@ -134,7 +136,8 @@ fn bwrap_supervisor_does_not_retain_host_environment() {
         "unexpected child environment: {stdout}"
     );
 
-    let inherited = Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    let inherited = command
         .env("AI_JAIL_HOST_ONLY_SENTINEL", &marker)
         .args([
             "--clean",
@@ -184,7 +187,8 @@ fn netns_probe_never_executes_path_bwrap() {
     // Default toolchain egress invokes the network-namespace capability
     // probe before a dry run. The probe must use the same trusted resolver as
     // launch, never the first `bwrap` supplied by an untrusted PATH.
-    let _ = Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    let _ = command
         .env("PATH", path)
         .args([
             "--clean",
@@ -204,7 +208,8 @@ fn netns_probe_never_executes_path_bwrap() {
 /// Run a command inside the sandbox (lockdown mode).
 fn lockdown_run(args: &[&str]) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    command
         .args(["--clean", "--lockdown", "--no-status-bar"])
         .args(args)
         .output()
@@ -246,7 +251,8 @@ fn assert_blocked_or_skipped(output: &Output, test_name: &str) {
 /// Run a command inside the sandbox with unrestricted network.
 fn network_run(args: &[&str]) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    Command::new(ai_jail())
+    let (mut command, _home) = isolated_ai_jail();
+    command
         .args([
             "--clean",
             "--network",
@@ -389,7 +395,8 @@ fn netlink_route_is_blocked_in_lockdown() {
     let bin = helper_bin();
     let out = {
         let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-        Command::new(ai_jail())
+        let (mut command, _home) = isolated_ai_jail();
+        command
             .args(["--clean", "--lockdown", "--network", "--no-status-bar"])
             .args([bin.to_str().unwrap(), "netlink_route"])
             .output()

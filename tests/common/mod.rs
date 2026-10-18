@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 
+static NEXT_TEST_HOME: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Maximum size of one audit record, mirrored from the product code.
 pub const MAX_RECORD: usize = 8 * 1024 * 1024;
 
@@ -27,6 +30,45 @@ pub static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn ai_jail() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
+}
+
+/// A disposable HOME for an ai-jail subprocess. The CLI always reads the
+/// trusted global `$HOME/.ai-jail`, even when a test passes `--clean`, so
+/// every integration launch should use an empty home unless the test is
+/// explicitly exercising global-config behavior.
+pub struct TestHome {
+    path: PathBuf,
+}
+
+impl TestHome {
+    pub fn new() -> Self {
+        let id =
+            NEXT_TEST_HOME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ai-jail-test-home-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Construct the project binary with an isolated HOME. Keep the returned
+/// `TestHome` alive until after the child exits.
+pub fn isolated_ai_jail() -> (Command, TestHome) {
+    let home = TestHome::new();
+    let mut command = Command::new(ai_jail());
+    command.env("HOME", home.path());
+    (command, home)
 }
 
 /// Can bwrap create the namespaces needed for normal mode?
@@ -176,7 +218,7 @@ pub fn curl(port: u16) -> String {
 /// ai-jail's own proxy settings can reach the sandbox.
 pub fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    let mut command = Command::new(ai_jail());
+    let (mut command, _home) = isolated_ai_jail();
     command.args(["--no-status-bar", "--exec", "--no-save-config"]);
     if dir.is_none() {
         command.arg("--clean");
