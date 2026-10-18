@@ -1,5 +1,14 @@
 # ai-jail — Development Guidelines
 
+> **Fork notice (k0valik/ai-jail, `mine` branch).** This checkout is a
+> personal fork tracking `akitaonrails/ai-jail`. Before working here,
+> read [MINE.md](MINE.md) — it is the authoritative divergence manifest
+> (what we changed and why, host prerequisites, config, upstream-merge
+> workflow). Scope: WSL2 and Linux x86_64 only. Linux PR checks, `mine`-branch
+> binary builds with provenance, and fork-maintenance sync automation are in
+> scope; macOS and package publishing are out of scope. Keep tags aligned with
+> upstream. Never open upstream issues or PRs.
+
 ## What This Project Is
 
 A Rust CLI tool that wraps bubblewrap (`bwrap`) to sandbox AI coding agents (Claude Code, GPT Codex, OpenCode, Crush). It replaces a bash script with config persistence (`.ai-jail` TOML), proper signal handling, and a developer-friendly CLI.

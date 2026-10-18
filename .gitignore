@@ -2,3 +2,12 @@
 /result
 /.ai-jail
 /.codex
+/.aws/
+/.agents/
+!/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/upstream-maintenance/
+/.agents/skills/upstream-maintenance/*
+!/.agents/skills/upstream-maintenance/SKILL.md
