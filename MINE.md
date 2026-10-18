@@ -14,16 +14,20 @@ Version tags stay aligned with upstream.
 
 ## Fork-only behavior
 
-The product change retained on `mine` is optional persistence for selected
-`/tmp` cache leaves. It is configured only in trusted global config or on the
-command line; project `.ai-jail` files cannot enable it.
+The product change retained on `mine` persists selected `/tmp` cache leaves.
+Pi gets `/tmp/jiti` by default so concurrent jailed Pi agents reuse the Jiti
+cache. `--no-persistent-tmp` opts out for one launch. Other commands can opt in
+through trusted global config or the command line; project `.ai-jail` files
+cannot enable persistence.
 
 ```toml
 persistent_tmp = ["/tmp/jiti", "/tmp/node-compile-cache"]
 ```
 
 ```sh
-ai-jail --persistent-tmp /tmp/jiti pi
+ai-jail pi                       # persists /tmp/jiti by default
+ai-jail --no-persistent-tmp pi   # opts out for this launch
+ai-jail --persistent-tmp /tmp/node-compile-cache claude
 ```
 
 Each path must be a simple absolute path below `/tmp`. Its backing directory is

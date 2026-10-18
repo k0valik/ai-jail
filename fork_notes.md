@@ -20,8 +20,10 @@ operator-facing guide.
 
 Keep this as the only fork-specific runtime feature in the rebuilt source.
 Upstream has no equivalent flag, config field, mount behavior, or matching
-issue/PR at the comparison point. It persists only selected leaves such as
-`/tmp/jiti` using a jail-owned store under
+issue/PR at the comparison point. Pi receives `/tmp/jiti` by default so jailed
+Pi agents can reuse the Jiti cache; `--no-persistent-tmp` opts out for one
+launch. Other selected leaves remain opt-in through trusted global config or
+the CLI. All persisted leaves use a jail-owned store under
 `~/.local/share/ai-jail/persistent-tmp/`.
 
 The implementation accepts trusted global config and repeatable CLI flags,

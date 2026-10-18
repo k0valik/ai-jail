@@ -92,6 +92,8 @@ OPTIONS:
                                     with a jail-owned store dir (repeatable; e.g.
                                     /tmp/jiti, /tmp/node-compile-cache; trusted
                                     config only, not persisted to .ai-jail)
+    --no-persistent-tmp              Disable persistent /tmp leaves (including Pi's
+                                    default /tmp/jiti cache)
     --secret <KEY=host>             Keep KEY's real value out of the sandbox: the child
                                     sees a placeholder; the egress proxy substitutes the
                                     real value only for requests to host (repeatable;
@@ -211,6 +213,8 @@ pub struct CliArgs {
     /// their contents survive across launches (jiti / node-compile
     /// caches). Trusted layers only; never persisted.
     pub persistent_tmp: Vec<String>,
+    /// Disable persistent /tmp leaves, including the default Pi Jiti cache.
+    pub no_persistent_tmp: bool,
     pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
@@ -499,6 +503,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 }
                 args.persistent_tmp.push(path.into_owned());
             }
+            Long("no-persistent-tmp") => args.no_persistent_tmp = true,
             Long("secret") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -772,6 +777,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--env",
     "--env-from-file",
     "--persistent-tmp",
+    "--no-persistent-tmp",
     "--secret",
     "--mise",
     "--no-mise",
@@ -915,6 +921,13 @@ mod tests {
     #[test]
     fn parse_pi_command() {
         let args = parse_test(&["pi"]).unwrap();
+        assert_eq!(args.command, vec!["pi"]);
+    }
+
+    #[test]
+    fn parse_no_persistent_tmp() {
+        let args = parse_test(&["--no-persistent-tmp", "pi"]).unwrap();
+        assert!(args.no_persistent_tmp);
         assert_eq!(args.command, vec!["pi"]);
     }
 

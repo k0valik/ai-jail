@@ -1058,6 +1058,12 @@ fn global_config_for_command(
     {
         base = merge_trusted(base, command_config.clone());
     }
+    if !cli.no_persistent_tmp
+        && command::effective_name(&selected_command) == Some("pi")
+    {
+        base.persistent_tmp.push("/tmp/jiti".into());
+        dedup_strings(&mut base.persistent_tmp);
+    }
     base
 }
 
@@ -2055,10 +2061,14 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
-    config
-        .persistent_tmp
-        .extend(cli.persistent_tmp.iter().cloned());
-    dedup_strings(&mut config.persistent_tmp);
+    if cli.no_persistent_tmp {
+        config.persistent_tmp.clear();
+    } else {
+        config
+            .persistent_tmp
+            .extend(cli.persistent_tmp.iter().cloned());
+        dedup_strings(&mut config.persistent_tmp);
+    }
 
     config
         .env_from_file
@@ -2751,6 +2761,57 @@ agent_state = true
             global.persistent_tmp(),
             &["/tmp/jiti", "/tmp/node-compile-cache"]
         );
+    }
+
+    #[test]
+    fn pi_defaults_to_persistent_jiti_cache() {
+        let global = parse_global_toml(
+            r#"
+persistent_tmp = ["/tmp/shared-cache"]
+
+[commands.pi]
+persistent_tmp = ["/tmp/pi-extra"]
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["pi".into()],
+            ..CliArgs::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+
+        assert_eq!(
+            selected.persistent_tmp(),
+            &["/tmp/shared-cache", "/tmp/pi-extra", "/tmp/jiti"]
+        );
+    }
+
+    #[test]
+    fn other_commands_do_not_get_the_pi_jiti_default() {
+        let global = parse_global_toml("command = [\"claude\"]").unwrap();
+        let selected = global_config_for_command(
+            global,
+            &CliArgs::default(),
+            &Config::default(),
+        );
+
+        assert!(selected.persistent_tmp().is_empty());
+    }
+
+    #[test]
+    fn no_persistent_tmp_clears_configured_and_default_leaves() {
+        let config = Config {
+            persistent_tmp: vec!["/tmp/jiti".into(), "/tmp/other".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            no_persistent_tmp: true,
+            ..CliArgs::default()
+        };
+
+        assert!(merge(&cli, config).persistent_tmp().is_empty());
     }
 
     #[test]
